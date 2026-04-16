@@ -1,0 +1,15 @@
+# 虚拟库名+表名 二级映射配置
+# 屏蔽底层物理库差异，Agent 只面对虚拟库
+databases:
+  order_db:
+    dialect: mysql
+    host: 10.0.0.1
+    port: 3306
+  log_db:
+    dialect: postgres
+    host: 10.0.0.2
+    port: 5432
+  finance_db:
+    dialect: oracle
+    host: 10.0.0.3
+    port: 1521
