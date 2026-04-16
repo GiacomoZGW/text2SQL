@@ -1,4 +1,4 @@
- 联邦分析 Data Agent 工作台 (Federated Data Agent Workspace)
+联邦分析 Data Agent 工作台 (Federated Data Agent Workspace)
 
 本项目是一个企业级的数据查询与分析中枢。通过引入 LangGraph 构建的多智能体（Multi-Agent）工作流，系统允许非技术人员使用自然语言直连底层异构数据库，实现高准确率的 Text-to-SQL 转化、跨库联邦查询以及自动化洞察报告生成。
 
