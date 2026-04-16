@@ -27,7 +27,7 @@
 
 快速启动 (Quick Start)
 
-1. 克隆项目与环境准备
+克隆项目与环境准备
 
 git clone (https://github.com/GiacomoZGW/text2SQL.git)
 cd text2SQL
@@ -41,21 +41,21 @@ npm install
 cd ..
 
 
-2. 配置环境变量
+配置环境变量
 
 在项目根目录创建 .env 文件并填入大模型 API Key：
 
 OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxxxxx"
 
 
-3. 生成测试数据库
+生成测试数据库
 
 运行内置的数据初始化脚本，基于 CSV 生成跨库物理演示集群：
 
 python init_multisource_db.py
 
 
-4. 一键启动前后端
+一键启动前后端
 
 运行项目内置的一键启动脚本，同时拉起 FastAPI 后端与 React 热更新前端：
 
