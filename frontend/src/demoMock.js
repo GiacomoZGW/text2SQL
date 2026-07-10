@@ -19,11 +19,10 @@ JOIN categories c ON c.id = p.category_id
 GROUP BY c.id, c.category_name
 ORDER BY total_amount DESC;`
         answer =
-          '【离线演示 · 模拟数据】按商品类别聚合的销售总额（示例）：\n\n' +
+          '【当前为离线交互演示（模拟 LLM 响应与数据库连接）】按商品类别聚合的销售总额（示例）：\n\n' +
           '1. 电子产品 · ¥128,400\n' +
           '2. 家居用品 · ¥86,200\n' +
-          '3. 服装鞋帽 · ¥54,900\n\n' +
-          '以上为前端内置样例，未连接真实数据库与 LLM。'
+          '3. 服装鞋帽 · ¥54,900\n\n'
       } else if (q.includes('城市') || q.includes('分布') || q.includes('电子')) {
         sql = `SELECT u.city, COUNT(DISTINCT u.id) AS buyer_count
 FROM users u
@@ -35,12 +34,11 @@ WHERE c.category_name LIKE '%电子%'
 GROUP BY u.city
 ORDER BY buyer_count DESC;`
         answer =
-          '【离线演示 · 模拟数据】购买过「电子产品」相关类目的用户城市分布（示例）：\n\n' +
+          '【当前为离线交互演示（模拟 LLM 响应与数据库连接）】购买过「电子产品」相关类目的用户城市分布（示例）：\n\n' +
           '· 深圳：128 人\n' +
           '· 上海：96 人\n' +
           '· 北京：84 人\n' +
-          '· 广州：71 人\n\n' +
-          '关闭「离线演示模式」并启动后端后，可查询真实库。'
+          '· 广州：71 人\n\n'
       } else if (q.includes('跨库') || q.includes('行为') || q.includes('转化') || q.includes('加购')) {
         sql = `-- [离线演示 - 多源联邦引擎激活]
 -- 挂载库: mysql_business.db, mongo_logs.db

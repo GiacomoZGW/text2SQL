@@ -1,4 +1,3 @@
-
 import json
 import sqlite3
 import os
@@ -189,7 +188,7 @@ def sql_generator_agent(state: AgentState):
 
 def boundary_executor_agent(state: AgentState):
     db_type = state.get("target_db_type", "sqlite")
-    print(f"⚙️ [4. BoundaryExecutor] 正在底层数据库中抓取数据...")
+    print(f"⚙ [4. BoundaryExecutor] 正在底层数据库中抓取数据...")
 
     sql = state["generated_sql"]
     result = execute_real_sql(sql, db_type)

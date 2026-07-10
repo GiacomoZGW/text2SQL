@@ -22,7 +22,7 @@ function welcomeContent(isDemo) {
   if (isDemo) {
     return '你好！当前为 **离线演示模式**。\n\n无需启动后端即可体验界面与模拟问答流程；返回的 SQL 与分析内容为**前端内置样例**，不代表真实库查询结果。\n\n关闭侧栏「离线演示模式」后，可连接真实数据库与 Agent。';
   }
-  return '你好！我是企业级 Data Agent。\n\n我已经连接到了底层的真实数据库。\n您可以直接用自然语言问我关于数据的问题，我会自动为您**编写SQL**、**执行查询**并**生成分析报告**。';
+  return '你好！我是 Data Agent。\n\n我已经连接到了底层的真实数据库。\n您可以直接用自然语言问我关于数据的问题，我会自动为您**编写SQL**、**执行查询**并**生成分析报告**。';
 }
 
 /** 开发：Vite 代理 /api。生产：与页面同域（便于 FastAPI 一体托管）或由 VITE_API_BASE 指定 */
@@ -169,7 +169,7 @@ const Chat = () => {
         msg.id === aiMsgId ? {
           ...msg,
           status: 'error',
-          content: `执行失败。\n错误详情: ${error.message}\n💡 可开启侧栏「离线演示模式」体验界面；完整能力请运行 python api/main.py 启动后端。`,
+          content: `执行失败。\n错误详情: ${error.message}\n💡 可开启侧栏「离线演示模式」体验界面；如需体验完整 LLM 生成与实时查询，请克隆仓库并运行 python api/main.py 启动后端。`,
           steps: []
         } : msg
       ));
