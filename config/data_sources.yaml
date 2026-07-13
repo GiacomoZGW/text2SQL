@@ -1,0 +1,45 @@
+data_sources:
+  - id: sqlite_local
+    name: SQLite Ecommerce Demo
+    engine: sqlite
+    status: ready
+    connection_secret_ref: ECOMMERCE_SQLITE_PATH
+    schema_scope: ecommerce
+    enabled: true
+    execution_mode: sqlite
+
+  - id: federated_demo
+    name: DuckDB Federated Demo
+    engine: duckdb
+    status: ready
+    connection_secret_ref: FEDERATION_CONFIG
+    schema_scope: db_mysql,db_mongo,db_ch
+    enabled: true
+    execution_mode: federated
+
+  - id: mysql_business
+    name: MySQL Business Database
+    engine: mysql
+    status: not_configured
+    connection_secret_ref: MYSQL_URI
+    schema_scope: business
+    enabled: false
+    execution_mode: federated
+
+  - id: postgres_logs
+    name: PostgreSQL Logs Database
+    engine: postgres
+    status: not_configured
+    connection_secret_ref: POSTGRES_URI
+    schema_scope: behavior_logs
+    enabled: false
+    execution_mode: federated
+
+  - id: clickhouse_features
+    name: ClickHouse Feature Warehouse
+    engine: clickhouse
+    status: not_configured
+    connection_secret_ref: CLICKHOUSE_URI
+    schema_scope: features
+    enabled: false
+    execution_mode: federated

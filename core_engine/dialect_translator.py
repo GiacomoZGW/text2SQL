@@ -1,5 +1,5 @@
 import traceback
-from mindsdb_sql_parser.parser import parse_sql
+from mindsdb_sql_parser import parse_sql
 # 导入 MindsDB 的 SQLAlchemy Renderer 进行方言转换
 from core_engine.mindsdb_core.utilities.render.sqlalchemy_render import SqlalchemyRender
 from core_engine.database_manager import DatabaseManager

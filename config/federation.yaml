@@ -1,0 +1,14 @@
+engine: duckdb
+sources:
+  db_mysql:
+    type: mysql
+    uri_env: MYSQL_URI
+    demo_sqlite: mysql_business.db
+  db_mongo:
+    type: postgres
+    uri_env: POSTGRES_URI
+    demo_sqlite: mongo_logs.db
+  db_ch:
+    type: clickhouse
+    uri_env: CLICKHOUSE_URI
+    demo_sqlite: clickhouse_features.db

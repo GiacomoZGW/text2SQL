@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Send, Database, LayoutDashboard, Settings, Loader2,
-  Code2, TerminalSquare, AlertCircle, CheckCircle2, User, Bot, Sparkles, Server, Search, FileJson, BarChart3
+  Code2, TerminalSquare, AlertCircle, CheckCircle2, User, Bot, Sparkles, Server, FileJson, BarChart3, ShieldCheck, BrainCircuit, Pause, RotateCcw, Trash2
 } from 'lucide-react';
 import { fetchDemoQuery } from './demoMock.js';
+import TokenMonitor from './TokenMonitor.jsx';
 
 const DEMO_STORAGE_KEY = 'text2sql_offline_demo';
+const CONVERSATION_STORAGE_KEY = 'text2sql_conversation_id';
+const USER_ID = 'test_user_001';
 
 function readDemoModeInitial() {
   try {
@@ -26,16 +29,32 @@ function welcomeContent(isDemo) {
 }
 
 /** 开发：Vite 代理 /api。生产：与页面同域（便于 FastAPI 一体托管）或由 VITE_API_BASE 指定 */
-function queryUrl() {
-  if (import.meta.env.DEV) return '/api/v1/query';
+function apiUrl(path) {
+  if (import.meta.env.DEV) return path;
   const base = import.meta.env.VITE_API_BASE;
   if (base !== undefined && base !== '') {
-    return `${String(base).replace(/\/$/, '')}/api/v1/query`;
+    return `${String(base).replace(/\/$/, '')}${path}`;
   }
   if (typeof window !== 'undefined') {
-    return `${window.location.origin}/api/v1/query`;
+    return `${window.location.origin}${path}`;
   }
-  return 'http://127.0.0.1:8000/api/v1/query';
+  return `http://127.0.0.1:8000${path}`;
+}
+
+function readConversationId() {
+  try {
+    const current = sessionStorage.getItem(CONVERSATION_STORAGE_KEY);
+    if (current) return current;
+    const next = globalThis.crypto?.randomUUID?.() || `conversation-${Date.now()}`;
+    sessionStorage.setItem(CONVERSATION_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return `conversation-${Date.now()}`;
+  }
+}
+
+function queryUrl() {
+  return apiUrl('/api/v1/query');
 }
 
 const Chat = () => {
@@ -51,8 +70,120 @@ const Chat = () => {
   ]);
   const [inputValue, setInputValue] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [targetDb, setTargetDb] = useState('sqlite');
+  const [pauseAvailable, setPauseAvailable] = useState(false);
+  const [dataSources, setDataSources] = useState([]);
+  const [dataSourceId, setDataSourceId] = useState('');
+  const [dataSourceError, setDataSourceError] = useState('');
+  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [memoryUpdating, setMemoryUpdating] = useState(false);
+  const [clarificationParentRequestId, setClarificationParentRequestId] = useState('');
+  const [conversationId] = useState(readConversationId);
+  const [activeView, setActiveView] = useState('workspace');
+  const [monitorSummary, setMonitorSummary] = useState(null);
+  const [monitorLoading, setMonitorLoading] = useState(false);
+  const [monitorError, setMonitorError] = useState('');
   const messagesEndRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const activeRequestIdRef = useRef('');
+  const pauseRequestedRef = useRef(false);
+  const processingTimerIdsRef = useRef([]);
+  const selectedDataSource = dataSources.find((source) => source.id === dataSourceId);
+
+  const loadMonitorSummary = async () => {
+    setMonitorLoading(true);
+    setMonitorError('');
+    try {
+      const response = await fetch(apiUrl('/api/v1/observability/summary?window_hours=24'));
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const payload = await response.json();
+      if (payload.code !== 200) throw new Error('监控接口返回异常');
+      setMonitorSummary(payload.data);
+    } catch (error) {
+      const paused = error.name === 'AbortError';
+      setMonitorError(`无法加载监控数据：${error.message}`);
+    } finally {
+      setMonitorLoading(false);
+    }
+  };
+
+  const loadDataSources = async () => {
+    setDataSourceError('');
+    try {
+      const response = await fetch(apiUrl('/api/v1/data-sources'));
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const payload = await response.json();
+      if (payload.code !== 200 || !Array.isArray(payload.data)) throw new Error('数据源接口返回异常');
+      const preferenceResponse = await fetch(apiUrl(`/api/v1/memory/preferences/${USER_ID}`));
+      const preferencePayload = preferenceResponse.ok ? await preferenceResponse.json() : { data: {} };
+      const preferredSourceId = preferencePayload.data?.default_data_source_id;
+      setMemoryEnabled(preferencePayload.data?.memory_enabled !== false);
+      setDataSources(payload.data);
+      setDataSourceId((current) => {
+        if (payload.data.some((source) => source.id === preferredSourceId)) return preferredSourceId;
+        return payload.data.some((source) => source.id === current) ? current : (payload.data[0]?.id || '');
+      });
+    } catch (error) {
+      setDataSourceError(`无法加载数据源：${error.message}`);
+    }
+  };
+
+  const updateMemoryEnabled = async (next) => {
+    setMemoryUpdating(true);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/memory/preferences/${USER_ID}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ memory_enabled: next })
+      });
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const payload = await response.json();
+      if (payload.code !== 200) throw new Error('记忆设置保存失败');
+      setMemoryEnabled(payload.data.memory_enabled);
+    } catch (error) {
+      setDataSourceError(`无法更新记忆设置：${error.message}`);
+    } finally {
+      setMemoryUpdating(false);
+    }
+  };
+
+  const clearUserMemory = async () => {
+    if (!window.confirm('确认删除当前用户的会话、语义和偏好记忆吗？')) return;
+    setMemoryUpdating(true);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/memory/${USER_ID}`), { method: 'DELETE' });
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      setClarificationParentRequestId('');
+      setMemoryEnabled(true);
+      await loadDataSources();
+    } catch (error) {
+      setDataSourceError(`无法删除记忆：${error.message}`);
+    } finally {
+      setMemoryUpdating(false);
+    }
+  };
+
+  const clearProcessingTimers = () => {
+    processingTimerIdsRef.current.forEach((timerId) => clearTimeout(timerId));
+    processingTimerIdsRef.current = [];
+  };
+
+  const handlePause = () => {
+    pauseRequestedRef.current = true;
+    const requestId = activeRequestIdRef.current;
+    if (requestId) {
+      fetch(apiUrl(`/api/v1/requests/${requestId}/pause`), { method: 'POST' }).catch(() => {});
+    }
+    abortControllerRef.current?.abort();
+    clearProcessingTimers();
+    setPauseAvailable(false);
+    setMessages((prev) => prev.map((message) => message.status === 'thinking' ? {
+      ...message,
+      status: 'paused',
+      content: '当前请求已暂停。',
+      steps: []
+    } : message));
+    setIsProcessing(false);
+  };
 
   const persistDemoMode = (next) => {
     setDemoMode(next);
@@ -70,6 +201,10 @@ const Chat = () => {
     });
   }, [demoMode]);
 
+  useEffect(() => {
+    loadDataSources();
+  }, [demoMode]);
+
   const quickExamples = [
     { icon: "📊", title: "统计各商品类别的销售总额", prompt: "统计一下各商品类别的销售总额，并按金额降序排列" },
     { icon: "🏙️", title: "电子产品购买用户的城市分布", prompt: "查找购买了电子产品的用户城市分布情况" },
@@ -84,12 +219,22 @@ const Chat = () => {
     scrollToBottom();
   }, [messages]);
 
+  useEffect(() => {
+    if (activeView === 'monitor') loadMonitorSummary();
+  }, [activeView]);
+
   const handleSend = async (overrideText = null) => {
     const userText = overrideText || inputValue.trim();
     if (!userText || isProcessing) return;
 
     setInputValue('');
     setIsProcessing(true);
+    setPauseAvailable(false);
+    pauseRequestedRef.current = false;
+    clearProcessingTimers();
+    const requestId = globalThis.crypto?.randomUUID?.() || `request-${Date.now()}`;
+    activeRequestIdRef.current = requestId;
+    abortControllerRef.current = new AbortController();
 
     const newUserMsg = { id: Date.now(), role: 'user', content: userText };
 
@@ -100,11 +245,15 @@ const Chat = () => {
       content: '',
       sql: null,
       status: 'thinking',
+      requestText: userText,
       steps: [
-        { id: 'router', name: '意图分发 Agent', status: 'pending' },
-        { id: 'retriever', name: '语义检索 Agent', status: 'pending' },
-        { id: 'sql_gen', name: 'SQL 生成 Agent', status: 'pending' },
-        { id: 'executor', name: '边界检测与执行', status: 'pending' },
+        { id: 'supervisor', name: '查询规划 Supervisor', status: 'pending' },
+        { id: 'schema', name: '实时 Schema Agent', status: 'pending' },
+        { id: 'retrieval', name: 'Chroma Schema 检索', status: 'pending' },
+        { id: 'sql', name: 'SQL 生成 Agent', status: 'pending' },
+        { id: 'validator', name: 'SQL 校验 Agent', status: 'pending' },
+        { id: 'reviewer', name: 'SQL 评审 Agent', status: 'pending' },
+        { id: 'executor', name: '只读执行 Agent', status: 'pending' },
         { id: 'analyst', name: '数据分析 Agent', status: 'pending' }
       ]
     };
@@ -123,19 +272,41 @@ const Chat = () => {
       }));
     };
 
+    const scheduleStep = (callback, delay) => {
+      const timerId = setTimeout(callback, delay);
+      processingTimerIdsRef.current.push(timerId);
+    };
+
+    // Keep the send control stable: the pause control replaces the loader only
+    // after the request has been running long enough to make pausing useful.
+    scheduleStep(() => setPauseAvailable(true), 2000);
+
     try {
-      updateStep('router', 'running');
-      setTimeout(() => { updateStep('router', 'completed'); updateStep('retriever', 'running'); }, 600);
-      setTimeout(() => { updateStep('retriever', 'completed'); updateStep('sql_gen', 'running'); }, 1500);
+      updateStep('supervisor', 'running');
+      scheduleStep(() => { updateStep('supervisor', 'completed'); updateStep('schema', 'running'); }, 400);
+      scheduleStep(() => { updateStep('schema', 'completed'); updateStep('retrieval', 'running'); }, 900);
+      scheduleStep(() => { updateStep('retrieval', 'completed'); updateStep('sql', 'running'); }, 1500);
+      scheduleStep(() => { updateStep('sql', 'completed'); updateStep('validator', 'running'); }, 2300);
+      scheduleStep(() => { updateStep('validator', 'completed'); updateStep('reviewer', 'running'); }, 2900);
+      scheduleStep(() => { updateStep('reviewer', 'completed'); updateStep('executor', 'running'); }, 3400);
 
       let resData;
       if (demoMode) {
-        resData = await fetchDemoQuery(userText, targetDb);
+        const demoTarget = dataSources.find((source) => source.id === dataSourceId)?.engine === 'duckdb' ? 'federated' : 'sqlite';
+        resData = await fetchDemoQuery(userText, demoTarget);
       } else {
         const response = await fetch(queryUrl(), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: userText, target_db: targetDb })
+          body: JSON.stringify({
+            user_id: USER_ID,
+            query: userText,
+            data_source_id: dataSourceId || undefined,
+            conversation_id: conversationId,
+            clarification_parent_request_id: clarificationParentRequestId || undefined,
+            client_request_id: requestId
+          }),
+          signal: abortControllerRef.current.signal
         });
 
         if (!response.ok) {
@@ -145,17 +316,26 @@ const Chat = () => {
         resData = await response.json();
       }
 
-      updateStep('sql_gen', 'completed');
+      updateStep('sql', 'completed');
+      updateStep('validator', 'completed');
+      updateStep('reviewer', 'completed');
       updateStep('executor', 'completed');
       updateStep('analyst', 'completed');
 
       if (resData.code === 200) {
+        const intent = resData.data.metrics?.intent;
+        const requestId = resData.data.metrics?.observability_request_id;
+        if (intent?.needs_clarification && requestId) {
+          setClarificationParentRequestId(requestId);
+        } else if (intent?.name === 'text_to_sql' || intent?.name === 'data_analysis') {
+          setClarificationParentRequestId('');
+        }
         setMessages(prev => prev.map(msg =>
           msg.id === aiMsgId ? {
             ...msg,
             status: 'completed',
             content: resData.data.answer,
-            sql: resData.data.metrics?.executed_sql || '-- 底层 SQL 执行记录为空',
+            sql: resData.data.metrics?.executed_sql || null,
             steps: []
           } : msg
         ));
@@ -165,15 +345,23 @@ const Chat = () => {
 
     } catch (error) {
       console.error("API 调用失败:", error);
+      const paused = pauseRequestedRef.current || error.name === 'AbortError';
       setMessages(prev => prev.map(msg =>
         msg.id === aiMsgId ? {
           ...msg,
-          status: 'error',
-          content: `执行失败。\n错误详情: ${error.message}\n💡 可开启侧栏「离线演示模式」体验界面；如需体验完整 LLM 生成与实时查询，请克隆仓库并运行 python api/main.py 启动后端。`,
+          status: paused ? 'paused' : 'error',
+          content: paused
+            ? '当前请求已暂停。'
+            : `执行失败。\n错误详情: ${error.message}\n💡 可开启侧栏「离线演示模式」体验界面；如需体验完整 LLM 生成与实时查询，请克隆仓库并运行 python api/main.py 启动后端。`,
           steps: []
         } : msg
       ));
     } finally {
+      clearProcessingTimers();
+      setPauseAvailable(false);
+      abortControllerRef.current = null;
+      activeRequestIdRef.current = '';
+      pauseRequestedRef.current = false;
       setIsProcessing(false);
     }
   };
@@ -183,9 +371,12 @@ const Chat = () => {
     if (status === 'completed') return <CheckCircle2 className="w-4 h-4 text-emerald-500" />;
 
     switch (stepId) {
-      case 'router': return <Search className="w-4 h-4 text-slate-400" />;
-      case 'retriever': return <Database className="w-4 h-4 text-slate-400" />;
-      case 'sql_gen': return <Code2 className="w-4 h-4 text-slate-400" />;
+      case 'supervisor': return <Bot className="w-4 h-4 text-slate-400" />;
+      case 'schema': return <Database className="w-4 h-4 text-slate-400" />;
+      case 'retrieval': return <Database className="w-4 h-4 text-slate-400" />;
+      case 'sql': return <Code2 className="w-4 h-4 text-slate-400" />;
+      case 'validator': return <ShieldCheck className="w-4 h-4 text-slate-400" />;
+      case 'reviewer': return <ShieldCheck className="w-4 h-4 text-slate-400" />;
       case 'executor': return <FileJson className="w-4 h-4 text-slate-400" />;
       case 'analyst': return <BarChart3 className="w-4 h-4 text-slate-400" />;
       default: return <div className="w-4 h-4 rounded-full bg-slate-200" />;
@@ -213,16 +404,43 @@ const Chat = () => {
             </h3>
             <label className="block text-sm font-medium text-slate-300 mb-2">选择目标数据库引擎</label>
             <select
-              value={targetDb}
-              onChange={(e) => setTargetDb(e.target.value)}
+              value={dataSourceId}
+              onChange={(e) => setDataSourceId(e.target.value)}
+              disabled={!dataSources.length && !demoMode}
               className="w-full bg-slate-800/80 border border-slate-700 text-slate-200 text-sm rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 block p-3 outline-none transition-all cursor-pointer hover:bg-slate-800"
             >
-              <option value="sqlite">SQLite </option>
-              <option value="federated">多源联邦引擎 (跨库集群)</option>
-              <option value="postgres">PostgreSQL 生产库(未录入)</option>
-              <option value="mysql">MySQL 业务库(未录入)</option>
-              <option value="clickhouse">ClickHouse 数仓(未录入)</option>
+              {dataSources.map((source) => (
+                <option key={source.id} value={source.id}>{source.name} ({source.engine})</option>
+              ))}
             </select>
+            {dataSourceError && <p className="mt-2 text-xs text-amber-300">{dataSourceError}</p>}
+          </div>
+
+          <div className="mb-8">
+            <h3 className="text-[11px] font-semibold text-slate-400 uppercase tracking-widest mb-3 flex items-center">
+              <BrainCircuit className="w-3.5 h-3.5 mr-1.5"/> 记忆
+            </h3>
+            <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/80 p-3">
+              <label className="flex flex-1 cursor-pointer items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={memoryEnabled}
+                  disabled={memoryUpdating}
+                  onChange={(e) => updateMemoryEnabled(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-600 text-indigo-500 focus:ring-blue-500"
+                />
+                <span className="text-sm font-medium text-slate-200">启用会话与语义记忆</span>
+              </label>
+              <button
+                type="button"
+                onClick={clearUserMemory}
+                disabled={memoryUpdating}
+                title="删除当前用户的记忆"
+                className="w-9 h-9 inline-flex items-center justify-center rounded-lg border border-slate-600 text-slate-300 hover:border-red-400 hover:text-red-300 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
           </div>
 
           <div className="mb-8">
@@ -278,16 +496,36 @@ const Chat = () => {
 
       <div className="flex-1 flex flex-col relative bg-white">
         <header className="h-16 bg-white border-b border-slate-100 flex items-center px-8 shadow-sm z-10 justify-between">
-          <h1 className="text-[15px] font-semibold text-slate-800 flex items-center">
-            <LayoutDashboard className="w-4 h-4 mr-2 text-indigo-500"/>
-            联邦分析工作台
-          </h1>
+          <div className="flex items-center gap-1 border border-slate-200 bg-slate-50 p-1 rounded-lg" role="tablist" aria-label="工作台视图">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'workspace'}
+              onClick={() => setActiveView('workspace')}
+              className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md ${activeView === 'workspace' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+            >
+              <LayoutDashboard className="w-4 h-4" />
+              查询工作台
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'monitor'}
+              onClick={() => setActiveView('monitor')}
+              className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md ${activeView === 'monitor' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+            >
+              <BarChart3 className="w-4 h-4" />
+              Token 监控
+            </button>
+          </div>
           <div className="flex items-center space-x-2 bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-full text-xs font-medium border border-indigo-100">
             <Sparkles className="w-3.5 h-3.5" />
             <span>AI 自动 SQL 生成</span>
           </div>
         </header>
 
+        {activeView === 'workspace' ? (
+          <>
         <div className="flex-1 overflow-y-auto p-4 sm:p-8 space-y-6 sm:space-y-8 bg-slate-50">
           {messages.map((msg, index) => (
             <div key={msg.id} className="flex flex-col">
@@ -364,6 +602,24 @@ const Chat = () => {
                           </div>
                         )}
 
+                        {msg.status === 'paused' && (
+                          <div className="flex items-start gap-3 text-amber-700 bg-amber-50 px-6 py-5 rounded-2xl rounded-tl-none border border-amber-200 shadow-sm">
+                            <Pause className="w-5 h-5 mt-0.5 flex-shrink-0" />
+                            <div className="min-w-0">
+                              <p className="text-[15px] leading-relaxed">当前请求已暂停。</p>
+                              <button
+                                type="button"
+                                onClick={() => handleSend(msg.requestText)}
+                                disabled={isProcessing || !msg.requestText}
+                                className="mt-3 inline-flex h-9 items-center gap-2 rounded-lg border border-amber-300 bg-white px-3 text-sm font-medium text-amber-800 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <RotateCcw className="w-4 h-4" />
+                                重试
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
                         {msg.status === 'completed' && msg.sql && (
                           <div className="bg-[#0f172a] rounded-2xl rounded-tl-none overflow-hidden shadow-md border border-slate-800">
                             <div className="bg-[#1e293b] px-5 py-2.5 flex items-center justify-between border-b border-slate-700/50">
@@ -413,15 +669,24 @@ const Chat = () => {
               disabled={isProcessing}
             />
             <button
-              onClick={() => handleSend()}
-              disabled={!inputValue.trim() || isProcessing}
+              type="button"
+              onClick={isProcessing ? handlePause : () => handleSend()}
+              disabled={isProcessing ? !pauseAvailable : !inputValue.trim()}
+              title={isProcessing ? (pauseAvailable ? '暂停当前请求' : '正在生成') : '发送请求'}
+              aria-label={isProcessing ? (pauseAvailable ? '暂停当前请求' : '正在生成') : '发送请求'}
               className={`absolute right-2 bottom-2 p-3 rounded-xl transition-all duration-200 flex items-center justify-center ${
-                !inputValue.trim() || isProcessing
-                ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
-                : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-md hover:shadow-lg transform hover:-translate-y-0.5 active:translate-y-0'
+                isProcessing
+                  ? (pauseAvailable
+                    ? 'bg-amber-500 text-white hover:bg-amber-600 shadow-md'
+                    : 'bg-slate-200 text-slate-400 cursor-wait')
+                  : (!inputValue.trim()
+                    ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                    : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-md hover:shadow-lg transform hover:-translate-y-0.5 active:translate-y-0')
               }`}
             >
-              {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5 ml-0.5" />}
+              {isProcessing
+                ? (pauseAvailable ? <Pause className="w-5 h-5" /> : <Loader2 className="w-5 h-5 animate-spin" />)
+                : <Send className="w-5 h-5 ml-0.5" />}
             </button>
           </div>
           <div className="text-center mt-3 text-xs text-slate-400 flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
@@ -429,10 +694,19 @@ const Chat = () => {
             <span className="text-slate-300 hidden sm:inline">|</span>
             <div className="flex items-center">
               <Database className="w-3.5 h-3.5 mr-1" />
-              {demoMode ? '离线演示 · 模拟数据' : '直连真实 SQLite 数据源'}
+              {demoMode ? '离线演示 · 模拟数据' : (selectedDataSource ? `${selectedDataSource.name} · ${selectedDataSource.status}` : '正在加载数据源')}
             </div>
           </div>
         </div>
+          </>
+        ) : (
+          <TokenMonitor
+            summary={monitorSummary}
+            loading={monitorLoading}
+            error={monitorError}
+            onRefresh={loadMonitorSummary}
+          />
+        )}
       </div>
     </div>
   );
