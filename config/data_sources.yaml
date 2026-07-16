@@ -24,7 +24,18 @@ data_sources:
     connection_secret_ref: MYSQL_URI
     schema_scope: business
     enabled: false
-    execution_mode: federated
+    execution_mode: direct
+    connector:
+      pool_size: 3
+      max_overflow: 2
+      pool_recycle_seconds: 1800
+      connect_timeout_seconds: 5
+      query_timeout_seconds: 30
+      max_rows: 50
+      tls:
+        enabled: true
+        mode: require
+        ca_cert_env: MYSQL_SSL_CA
 
   - id: postgres_logs
     name: PostgreSQL Logs Database
@@ -33,7 +44,19 @@ data_sources:
     connection_secret_ref: POSTGRES_URI
     schema_scope: behavior_logs
     enabled: false
-    execution_mode: federated
+    execution_mode: direct
+    connector:
+      schema: public
+      pool_size: 3
+      max_overflow: 2
+      pool_recycle_seconds: 1800
+      connect_timeout_seconds: 5
+      query_timeout_seconds: 30
+      max_rows: 50
+      tls:
+        enabled: true
+        mode: require
+        ca_cert_env: POSTGRES_SSL_ROOT_CERT
 
   - id: clickhouse_features
     name: ClickHouse Feature Warehouse
@@ -42,4 +65,14 @@ data_sources:
     connection_secret_ref: CLICKHOUSE_URI
     schema_scope: features
     enabled: false
-    execution_mode: federated
+    execution_mode: direct
+    connector:
+      pool_size: 3
+      max_overflow: 2
+      pool_recycle_seconds: 1800
+      connect_timeout_seconds: 5
+      query_timeout_seconds: 30
+      max_rows: 50
+      tls:
+        enabled: true
+        mode: require

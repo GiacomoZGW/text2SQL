@@ -15,7 +15,9 @@ from mindsdb_sql_parser import parse_sql
 from pydantic import BaseModel, Field, ValidationError
 
 from core_engine.federation_engine import FederationError, create_federation_engine
-from core_engine.data_source_registry import create_data_source_registry
+from core_engine.data_source_registry import DataSourceError, create_data_source_registry
+from core_engine.database_connectors import ConnectorError, direct_connector_registry
+from core_engine.access_control import AccessDeniedError, Principal, access_control
 from core_engine.request_control import RequestPaused, request_control
 from observability import observability_store
 from memory import semantic_memory_store
@@ -61,6 +63,7 @@ class AgentState(TypedDict, total=False):
     execution_trace: Annotated[List[dict[str, str]], operator.add]
     request_id: str
     user_id: str
+    principal: Principal
     user_query: str
     conversation_context: list[dict[str, Any]]
     user_preferences: dict[str, Any]
@@ -201,14 +204,38 @@ def _open_connection(db_type: str) -> sqlite3.Connection:
     return conn
 
 
+def _direct_connector_for(data_source_id: str):
+    try:
+        source = data_source_registry.resolve(data_source_id)
+    except DataSourceError as exc:
+        raise ConnectorError(f"Unknown direct data source: {data_source_id}") from exc
+    if source.get("execution_mode") != "direct":
+        raise ConnectorError(f"Data source is not configured for direct execution: {data_source_id}")
+    return direct_connector_registry.connector_for(source)
+
+
+def _sql_dialect_for_state(state: AgentState) -> str:
+    db_type = state.get("target_db_type", "sqlite")
+    if db_type == "federated":
+        return "duckdb"
+    if db_type == "direct":
+        try:
+            return str(data_source_registry.resolve(state.get("data_source_id", "")).get("engine", "sqlite"))
+        except DataSourceError:
+            return "sqlite"
+    return "sqlite"
+
+
 def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def get_database_schema(db_type: str) -> str:
+def get_database_schema(db_type: str, data_source_id: str = "") -> str:
     """Read the live standalone or DuckDB federated metadata."""
     if db_type == "federated":
         return federation_engine.get_schema()
+    if db_type == "direct":
+        return _direct_connector_for(data_source_id).get_schema()
 
     conn = _open_connection(db_type)
     try:
@@ -234,7 +261,7 @@ def _without_string_literals(sql: str) -> str:
     return re.sub(r"'(?:''|[^'])*'", "''", sql)
 
 
-def _prepare_read_only_sql(sql: str, db_type: str) -> tuple[str, str | None]:
+def _prepare_read_only_sql(sql: str, db_type: str, data_source_id: str = "") -> tuple[str, str | None]:
     """Return executable SQL only when it is a bounded, read-only SQLite query."""
     clean_sql = _clean_sql(sql)
     if not clean_sql:
@@ -270,6 +297,8 @@ def _prepare_read_only_sql(sql: str, db_type: str) -> tuple[str, str | None]:
     try:
         if db_type == "federated":
             federation_engine.explain(normalized)
+        elif db_type == "direct":
+            _direct_connector_for(data_source_id).explain(normalized)
         else:
             conn = _open_connection(db_type)
             try:
@@ -278,21 +307,21 @@ def _prepare_read_only_sql(sql: str, db_type: str) -> tuple[str, str | None]:
                 conn.close()
     except sqlite3.Error as exc:
         return "", f"SQL 预检失败: {exc}"
-    except (FederationError, OSError, ValueError) as exc:
+    except (ConnectorError, FederationError, OSError, ValueError) as exc:
         return "", str(exc)
 
     return normalized, None
 
 
-def validate_sql(sql: str, db_type: str = "sqlite") -> tuple[bool, str, str]:
+def validate_sql(sql: str, db_type: str = "sqlite", data_source_id: str = "") -> tuple[bool, str, str]:
     """Compatibility wrapper for callers that need a public SQL safety check."""
-    prepared_sql, validation_error = _prepare_read_only_sql(sql, db_type)
+    prepared_sql, validation_error = _prepare_read_only_sql(sql, db_type, data_source_id)
     return validation_error is None, prepared_sql, validation_error or ""
 
 
-def execute_real_sql(sql: str, db_type: str) -> str:
+def execute_real_sql(sql: str, db_type: str, data_source_id: str = "") -> str:
     """Execute one validated read-only query and return a bounded JSON result."""
-    prepared_sql, validation_error = _prepare_read_only_sql(sql, db_type)
+    prepared_sql, validation_error = _prepare_read_only_sql(sql, db_type, data_source_id)
     if validation_error:
         return f"ERROR: {validation_error}"
 
@@ -300,6 +329,8 @@ def execute_real_sql(sql: str, db_type: str) -> str:
     try:
         if db_type == "federated":
             result_list = federation_engine.execute(prepared_sql)
+        elif db_type == "direct":
+            result_list = _direct_connector_for(data_source_id).execute(prepared_sql)
         else:
             conn = _open_connection(db_type)
             try:
@@ -310,7 +341,7 @@ def execute_real_sql(sql: str, db_type: str) -> str:
         if not result_list:
             return "执行成功，但未找到匹配的数据 (结果为空)。"
         return json.dumps(result_list[:50], ensure_ascii=False)
-    except (sqlite3.Error, FederationError, OSError, ValueError) as exc:
+    except (ConnectorError, sqlite3.Error, FederationError, OSError, ValueError) as exc:
         return f"ERROR: {exc}"
 
 
@@ -652,9 +683,10 @@ def supervisor_agent(state: AgentState) -> dict[str, Any]:
     user_query = state["messages"][-1].content
     requested_target = str(state.get("target_db_type", "sqlite")).lower()
     federation_terms = ("跨库", "联邦", "mysql", "mongo", "clickhouse", "行为日志", "特征库")
-    resolved_target = "federated" if requested_target == "federated" or any(
-        term in user_query.lower() for term in federation_terms
-    ) else "sqlite"
+    if requested_target in {"direct", "federated"}:
+        resolved_target = requested_target
+    else:
+        resolved_target = "federated" if any(term in user_query.lower() for term in federation_terms) else "sqlite"
     plan = {
         "requested_target": requested_target,
         "execution_mode": resolved_target,
@@ -689,8 +721,8 @@ def supervisor_agent(state: AgentState) -> dict[str, Any]:
 def schema_agent(state: AgentState) -> dict[str, Any]:
     db_type = state.get("target_db_type", "sqlite")
     try:
-        schema_context = get_database_schema(db_type)
-    except (sqlite3.Error, FederationError, OSError, ValueError) as exc:
+        schema_context = get_database_schema(db_type, state.get("data_source_id", ""))
+    except (ConnectorError, sqlite3.Error, FederationError, OSError, ValueError) as exc:
         error = f"ERROR: Schema 加载失败: {exc}"
         return {
             "schema_error": error,
@@ -773,11 +805,20 @@ def sql_agent(state: AgentState) -> dict[str, Any]:
     db_type = state.get("target_db_type", "sqlite")
     if db_type == "federated":
         dialect_rules = "使用 DuckDB 联邦 SQL，并且表必须使用 Schema 中的库名前缀，例如 db_mysql.orders。"
+        dialect_name = "DuckDB federation"
+    elif db_type == "direct":
+        try:
+            source = data_source_registry.resolve(state.get("data_source_id", ""))
+            dialect_name = str(source.get("engine", "SQL")).upper()
+        except DataSourceError:
+            dialect_name = "configured database"
+        dialect_rules = f"使用 {dialect_name} 方言，并且仅使用当前数据源 Schema 中返回的表和字段。"
     else:
         dialect_rules = "使用 Schema 中的未限定表名，不要增加库名前缀。"
+        dialect_name = "SQLite"
 
     base_prompt = f"""
-你是 SQL 专家 Agent。请针对用户问题生成一条 SQLite 查询。
+你是 SQL 专家 Agent。请针对用户问题生成一条 {dialect_name} 查询。
 
 查询规划：{json.dumps(state.get('query_plan', {}), ensure_ascii=False)}
 Chroma 召回的 Schema：
@@ -815,8 +856,43 @@ def validator_agent(state: AgentState) -> dict[str, Any]:
     validated_candidates: list[dict[str, str]] = []
     validation_errors: list[str] = []
     for index, candidate_sql in enumerate(state.get("candidate_sqls", []), start=1):
+        policy_sql = candidate_sql
+        principal = state.get("principal")
+        if principal:
+            try:
+                policy_sql = access_control.enforce_sql_policy(
+                    principal,
+                    state.get("data_source_id", ""),
+                    candidate_sql,
+                    _sql_dialect_for_state(state),
+                )
+                observability_store.record_audit_event(
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant_id,
+                    role=principal.role,
+                    action="sql_policy_check",
+                    resource_type="data_source",
+                    resource_id=state.get("data_source_id", ""),
+                    request_id=state.get("request_id", ""),
+                    outcome="allowed",
+                    details={"candidate_index": index},
+                )
+            except AccessDeniedError as exc:
+                validation_errors.append(f"Candidate {index}: access policy rejected SQL: {exc}")
+                observability_store.record_audit_event(
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant_id,
+                    role=principal.role,
+                    action="sql_policy_check",
+                    resource_type="data_source",
+                    resource_id=state.get("data_source_id", ""),
+                    request_id=state.get("request_id", ""),
+                    outcome="denied",
+                    details={"candidate_index": index, "reason": str(exc)},
+                )
+                continue
         prepared_sql, validation_error = _prepare_read_only_sql(
-            candidate_sql, state.get("target_db_type", "sqlite")
+            policy_sql, state.get("target_db_type", "sqlite"), state.get("data_source_id", "")
         )
         if validation_error:
             validation_errors.append(f"候选 {index}: {validation_error}")
@@ -895,7 +971,9 @@ Schema：{state.get('relevant_schemas', '')}
 
 
 def executor_agent(state: AgentState) -> dict[str, Any]:
-    result = execute_real_sql(state.get("generated_sql", ""), state.get("target_db_type", "sqlite"))
+    result = execute_real_sql(
+        state.get("generated_sql", ""), state.get("target_db_type", "sqlite"), state.get("data_source_id", "")
+    )
     if result.startswith("ERROR:"):
         print(f"[Executor] failed: {result}")
         return {

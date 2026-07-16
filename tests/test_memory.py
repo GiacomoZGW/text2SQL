@@ -37,14 +37,18 @@ class MemoryStoreTests(unittest.TestCase):
                 "已按城市拆分订单数量。",
             )
 
-            context = store.get_conversation_context("conversation-1")
+            context = store.get_conversation_context("conversation-1", user_id="user-1")
             other_context = store.get_conversation_context("conversation-2")
+
+            store.record_turn("conversation-1", "user-2", "sqlite_local", "private", "greeting", {}, "private")
+            isolated_context = store.get_conversation_context("conversation-1", user_id="user-2")
 
             self.assertEqual(preferences["default_data_source_id"], "federated_demo")
             self.assertFalse(preferences["show_sql"])
             self.assertEqual(preferences["metric_aliases"]["GMV"], "actual_payment")
             self.assertEqual([turn["user_query"] for turn in context], ["统计上个月订单数量", "按城市拆分"])
             self.assertEqual(other_context, [])
+            self.assertEqual([turn["user_query"] for turn in isolated_context], ["private"])
 
     def test_memory_can_be_disabled_and_deleted_per_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:

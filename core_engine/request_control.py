@@ -1,6 +1,8 @@
-"""Cooperative request pause markers shared by the API and agent workflow."""
+"""Cooperative pause markers shared by API workers and the agent workflow."""
 
-from threading import Lock
+import os
+
+from .shared_state import SharedState, shared_state
 
 
 class RequestPaused(RuntimeError):
@@ -8,21 +10,24 @@ class RequestPaused(RuntimeError):
 
 
 class RequestControl:
-    def __init__(self):
-        self._paused_ids: set[str] = set()
-        self._lock = Lock()
+    def __init__(self, state: SharedState | None = None, pause_ttl_seconds: int | None = None):
+        self._state = state or shared_state
+        self.pause_ttl_seconds = max(
+            30, int(pause_ttl_seconds or os.getenv("REQUEST_PAUSE_TTL_SECONDS", "900"))
+        )
+
+    @staticmethod
+    def _key(request_id: str) -> str:
+        return f"paused-request:{request_id}"
 
     def pause(self, request_id: str) -> None:
-        with self._lock:
-            self._paused_ids.add(request_id)
+        self._state.set_text(self._key(request_id), "1", self.pause_ttl_seconds)
 
     def is_paused(self, request_id: str) -> bool:
-        with self._lock:
-            return request_id in self._paused_ids
+        return self._state.get_text(self._key(request_id)) == "1"
 
     def clear(self, request_id: str) -> None:
-        with self._lock:
-            self._paused_ids.discard(request_id)
+        self._state.delete(self._key(request_id))
 
 
 request_control = RequestControl()

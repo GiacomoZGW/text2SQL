@@ -20,4 +20,4 @@ When a URI is absent, the same alias is mounted through DuckDB's SQLite extensio
 
 DuckDB downloads an extension the first time it connects to a source type. The process running the API therefore needs network access for a source type whose extension is not already installed.
 
-Schema retrieval defaults to `dashscope_memory`, which keeps DashScope vectors in the API process and avoids local Chroma locking on this Windows environment. Set `SCHEMA_VECTOR_BACKEND=chroma` only after verifying the local `chromadb` runtime is stable.
+Schema retrieval defaults to `dashscope_memory`, which keeps DashScope vectors in the API process and avoids local Chroma locking on this Windows environment. Set `SCHEMA_VECTOR_BACKEND=chroma` only after installing `requirements-chroma.txt` and verifying the local Chroma runtime is stable.

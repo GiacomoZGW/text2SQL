@@ -96,7 +96,7 @@ export default function TokenMonitor({ summary, loading, error, onRefresh }) {
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
           <Metric icon={Coins} label="总 Token 消耗" value={formatNumber(llm.total_tokens)} />
           <Metric icon={Activity} label="请求数" value={formatNumber(requests.request_count)} />
-          <Metric icon={CheckCircle2} label="查询命中率" value={requests.success_rate || 0} suffix="%" />
+          <Metric icon={CheckCircle2} label="查询命中率" value={requests.technical_success_rate || 0} suffix="%" />
           <Metric icon={Timer} label="平均模型耗时" value={((llm.average_llm_latency_ms || 0) / 1000).toFixed(2)} suffix="s" />
         </div>
 
@@ -106,6 +106,22 @@ export default function TokenMonitor({ summary, loading, error, onRefresh }) {
             <h3 className="text-sm font-semibold text-slate-800">Token 消耗趋势</h3>
           </div>
           <TokenLineChart timeline={summary?.timeline || []} />
+        </section>
+
+        <section className="border-t border-slate-200 pt-5">
+          <div className="flex items-center gap-2 mb-4">
+            <CheckCircle2 className="w-4 h-4 text-indigo-500" />
+            <h3 className="text-sm font-semibold text-slate-800">查询质量与生命周期</h3>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+            <Metric icon={CheckCircle2} label="SQL 可执行率" value={requests.sql_executable_rate || 0} suffix="%" />
+            <Metric icon={CheckCircle2} label="结果正确率" value={requests.result_correct_rate || 0} suffix="%" />
+            <Metric icon={Gauge} label="用户满意度" value={requests.satisfaction_rate || 0} suffix="%" />
+            <Metric icon={Activity} label="运行中 / 已中止" value={`${formatNumber(requests.running_count)} / ${formatNumber(requests.aborted_count)}`} />
+          </div>
+          <div className="mt-3 text-xs text-slate-500">
+            查询命中率仅以终态请求为分母；SQL、结果和满意度仅以对应已评估样本为分母。
+          </div>
         </section>
 
         <section className="border-t border-slate-200 pt-5">
@@ -139,17 +155,17 @@ export default function TokenMonitor({ summary, loading, error, onRefresh }) {
         <section className="border-t border-slate-200 pt-5">
           <div className="flex items-center gap-2 mb-4">
             <Gauge className="w-4 h-4 text-indigo-500" />
-            <h3 className="text-sm font-semibold text-slate-800">Agent 命中率</h3>
+            <h3 className="text-sm font-semibold text-slate-800">Agent 完成率</h3>
           </div>
           <div className="border border-slate-200 bg-white rounded-lg overflow-hidden">
             <div className="grid grid-cols-[1fr_110px_110px] gap-3 bg-slate-50 border-b border-slate-200 px-4 py-3 text-xs text-slate-500">
-              <span>Agent</span><span>执行次数</span><span>命中率</span>
+              <span>Agent</span><span>执行次数</span><span>完成率</span>
             </div>
             {agentEffectiveness.length ? agentEffectiveness.map((agent) => (
               <div key={agent.agent} className="grid grid-cols-[1fr_110px_110px] gap-3 px-4 py-3 border-b border-slate-100 last:border-b-0 text-sm">
                 <span className="font-medium text-slate-700">{agent.agent}</span>
                 <span className="text-slate-500">{formatNumber(agent.event_count)}</span>
-                <span className="text-emerald-600">{agent.success_rate}%</span>
+                <span className="text-emerald-600">{agent.completion_rate}%</span>
               </div>
             )) : (
               <div className="px-4 py-8 text-sm text-slate-400">暂无 Agent 执行记录</div>

@@ -15,10 +15,13 @@ from dotenv import load_dotenv
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
 
+from core_engine.shared_state import shared_state
+
 VECTOR_STORE_DIR = Path(__file__).resolve().parent / "chroma_db"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_BACKEND = "dashscope_memory"
+SCHEMA_CACHE_TTL_SECONDS = max(60, int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "3600")))
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -85,17 +88,24 @@ def _memory_matches(query: str, documents: list[Document], db_type: str, limit: 
     cache = _MEMORY_CATALOGS.get(db_type)
     vectors: list[list[float]] | None = None
     detail_suffix = ""
+    shared_cache_key = f"schema-vectors:{db_type}:{catalog_hash}"
 
     if cache and cache["catalog_hash"] == catalog_hash:
         vectors = cache["vectors"]
     else:
-        try:
-            vectors = DashScopeSDKEmbeddings().embed_documents([document.page_content for document in documents])
-            if len(vectors) != len(documents):
-                raise ValueError("embedding count does not match schema documents")
-        except Exception as exc:
-            vectors = None
-            detail_suffix = f"; embedding fallback={exc}"
+        shared_vectors = shared_state.get_json(shared_cache_key)
+        if isinstance(shared_vectors, list) and len(shared_vectors) == len(documents):
+            vectors = shared_vectors
+            detail_suffix = "; cache=shared"
+        else:
+            try:
+                vectors = DashScopeSDKEmbeddings().embed_documents([document.page_content for document in documents])
+                if len(vectors) != len(documents):
+                    raise ValueError("embedding count does not match schema documents")
+                shared_state.set_json(shared_cache_key, vectors, SCHEMA_CACHE_TTL_SECONDS)
+            except Exception as exc:
+                vectors = None
+                detail_suffix = f"; embedding fallback={exc}"
         _MEMORY_CATALOGS[db_type] = {"catalog_hash": catalog_hash, "vectors": vectors}
 
     if vectors:
@@ -120,7 +130,7 @@ def _collection_name(db_type: str) -> str:
 
 def _get_chroma_vectorstore(db_type: str):
     # Import lazily so the default backend never loads Chroma's native runtime.
-    from langchain_community.vectorstores import Chroma
+    from langchain_chroma import Chroma
 
     VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
     return Chroma(

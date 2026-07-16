@@ -1,7 +1,10 @@
 
-from fastapi import FastAPI, HTTPException
+import json
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 import sys
@@ -17,7 +20,11 @@ if BASE_DIR not in sys.path:
 
 from agents.workflow import app as agent_app
 from core_engine.data_source_registry import DataSourceError, create_data_source_registry
+from core_engine.database_connectors import ConnectorError, direct_connector_registry
+from core_engine.access_control import AccessDeniedError, Principal, access_control
+from core_engine.evaluation import EvaluationCaseError, load_golden_cases, score_final_state
 from core_engine.request_control import RequestPaused, request_control
+from core_engine.request_runtime import RequestQueueFull, RequestTimedOut, request_runtime
 from langchain_core.messages import HumanMessage
 from memory import memory_store, semantic_memory_store
 from observability import observability_store
@@ -25,20 +32,63 @@ from observability import observability_store
 data_source_registry = create_data_source_registry(Path(BASE_DIR))
 LEGACY_DATA_SOURCE_IDS = {"sqlite": "sqlite_local", "federated": "federated_demo"}
 
-app = FastAPI(title="Data Agent 真实数据库查询 API", version="2.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    reconciled = observability_store.reconcile_stale_running_requests(
+        int(os.getenv("REQUEST_STALE_AFTER_SECONDS", "300"))
+    )
+    if reconciled:
+        print(f"[Observability] marked {reconciled} stale running requests as aborted")
+    await request_runtime.start()
+    yield
+    await request_runtime.stop()
+    direct_connector_registry.dispose_all()
+
+
+app = FastAPI(title="Data Agent 真实数据库查询 API", version="2.1", lifespan=lifespan)
+
+allowed_origins = [
+    value.strip()
+    for value in os.getenv("API_ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8000,http://localhost:8000").split(",")
+    if value.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.get("/health/live", include_in_schema=False)
+async def liveness_probe():
+    """Report whether the API process can receive traffic."""
+    return {"status": "live"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def readiness_probe():
+    """Report whether the local API runtime and source registry are ready."""
+    try:
+        enabled_sources = data_source_registry.list_enabled()
+    except DataSourceError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": str(exc)},
+        )
+
+    if not request_runtime._started:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": "request runtime is not started"},
+        )
+    return {"status": "ready", "enabled_data_sources": len(enabled_sources)}
+
+
 # 定义前端传入的数据结构
 class QueryRequest(BaseModel):
-    user_id: str = "test_user_001"
     query: str
     data_source_id: str | None = None
     conversation_id: str | None = None
@@ -67,43 +117,110 @@ class SemanticMemoryRequest(BaseModel):
     confirmed: bool = False
 
 
+class UserFeedbackRequest(BaseModel):
+    satisfied: bool
+    note: str | None = None
+
+
+class ResultEvaluationRequest(BaseModel):
+    correct: bool
+    note: str | None = None
+
+
+class EvaluationRunRequest(BaseModel):
+    case_ids: list[str] | None = None
+    include_extended: bool = False
+
+
+def _audit(
+    principal: Principal,
+    action: str,
+    resource_type: str,
+    outcome: str,
+    *,
+    resource_id: str | None = None,
+    request_id: str | None = None,
+    details: dict[str, object] | None = None,
+) -> None:
+    try:
+        observability_store.record_audit_event(
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            role=principal.role,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            request_id=request_id,
+            outcome=outcome,
+            details=details,
+        )
+    except Exception as exc:
+        print(f"[Audit] event skipped: {exc}")
+
+
+def _authorize_data_source(principal: Principal, data_source_id: str) -> None:
+    try:
+        access_control.authorize_data_source(principal, data_source_id)
+    except AccessDeniedError as exc:
+        _audit(principal, "data_source_access", "data_source", "denied", resource_id=data_source_id, details={"reason": str(exc)})
+        raise HTTPException(status_code=403, detail="You are not authorized for this data source") from exc
+
+
+def _authorize_request_owner(principal: Principal, request_id: str) -> None:
+    request_data = observability_store.get_request(request_id)
+    owner_id = (request_data or {}).get("request", {}).get("user_id")
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    access_control.require_self_or_admin(principal, str(owner_id))
+
+
 @app.post("/api/v1/query")
-async def query_database(request: QueryRequest):
+async def query_database(request: QueryRequest, principal: Principal = Depends(access_control.current_principal)):
     print(f"\n[API] received query: {request.query}")
-    user_preferences = memory_store.get_preferences(request.user_id)
+    user_preferences = memory_store.get_preferences(principal.user_id)
     memory_enabled = bool(user_preferences.get("memory_enabled", True))
     data_source_id = (
         request.data_source_id
         or (user_preferences.get("default_data_source_id") if memory_enabled else None)
         or LEGACY_DATA_SOURCE_IDS.get(request.target_db or "", "sqlite_local")
     )
+    retain_pause_marker = False
     try:
         data_source = data_source_registry.resolve(data_source_id)
     except DataSourceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _authorize_data_source(principal, data_source_id)
 
     request_id = (request.client_request_id or uuid4().hex).strip()
     if not request_id or len(request_id) > 128:
         raise HTTPException(status_code=422, detail="Invalid client_request_id")
+    if request.clarification_parent_request_id:
+        _authorize_request_owner(principal, request.clarification_parent_request_id)
     request_control.clear(request_id)
     started = time.perf_counter()
     execution_mode = str(data_source["execution_mode"])
-    conversation_context = memory_store.get_conversation_context(request.conversation_id) if memory_enabled else []
+    conversation_context = (
+        memory_store.get_conversation_context(request.conversation_id, user_id=principal.user_id) if memory_enabled else []
+    )
     observability_store.start_request(
         request_id,
-        request.user_id,
+        principal.user_id,
         request.query,
         execution_mode,
         data_source_id=data_source_id,
         conversation_id=request.conversation_id,
         clarification_parent_request_id=request.clarification_parent_request_id,
+        tenant_id=principal.tenant_id,
+        role=principal.role,
     )
+    _audit(principal, "query", "data_source", "started", resource_id=data_source_id, request_id=request_id)
 
     # 构造传递给 LangGraph 的初始状态
     initial_state = {
         "messages": [HumanMessage(content=request.query)],
         "request_id": request_id,
-        "user_id": request.user_id,
+        "user_id": principal.user_id,
+        "principal": principal,
         "data_source_id": data_source_id,
         "target_db_type": execution_mode,
         "conversation_context": conversation_context,
@@ -115,7 +232,7 @@ async def query_database(request: QueryRequest):
 
     try:
         # 调用 LangGraph 核心工作流
-        final_state = agent_app.invoke(initial_state)
+        final_state = await request_runtime.submit(request_id, lambda: agent_app.invoke(initial_state))
         if request_control.is_paused(request_id):
             raise RequestPaused("Request paused by user")
 
@@ -124,12 +241,20 @@ async def query_database(request: QueryRequest):
         execution_failed = final_state.get("execution_result", "").startswith("ERROR:") or final_state.get(
             "validation_result", ""
         ).startswith("ERROR:")
+        is_sql_request = final_state.get("intent") in {"text_to_sql", "data_analysis"}
+        sql_executable = (
+            bool(final_state.get("generated_sql"))
+            and final_state.get("validation_result") == "VALID"
+            and not final_state.get("execution_result", "").startswith("ERROR:")
+        ) if is_sql_request else None
         observability_store.complete_request(
             request_id=request_id,
             status="failed" if execution_failed else "success",
             latency_ms=(time.perf_counter() - started) * 1000,
             retries=final_state.get("error_count", 0),
             error_message=final_state.get("execution_result") if execution_failed else None,
+            technical_success=not execution_failed,
+            sql_executable=sql_executable,
         )
         if (
             request.clarification_parent_request_id
@@ -140,7 +265,7 @@ async def query_database(request: QueryRequest):
         if memory_enabled:
             memory_store.record_turn(
                 conversation_id=request.conversation_id,
-                user_id=request.user_id,
+                user_id=principal.user_id,
                 data_source_id=data_source_id,
                 user_query=request.query,
                 intent=final_state.get("intent", ""),
@@ -149,13 +274,13 @@ async def query_database(request: QueryRequest):
             )
         if request.data_source_id:
             user_preferences = memory_store.update_preferences(
-                request.user_id, {"default_data_source_id": data_source_id}
+                principal.user_id, {"default_data_source_id": data_source_id}
             )
         semantic_template = None
         if memory_enabled and not execution_failed and final_state.get("intent") in {"text_to_sql", "data_analysis"}:
             try:
                 semantic_template = semantic_memory_store.save_successful_sql_template(
-                    user_id=request.user_id,
+                    user_id=principal.user_id,
                     data_source_id=data_source_id,
                     sql=final_state.get("generated_sql", ""),
                     intent=final_state.get("intent", ""),
@@ -172,6 +297,16 @@ async def query_database(request: QueryRequest):
             "total_tokens": sum(call.get("total_tokens") or 0 for call in llm_calls),
             "llm_latency_ms": round(sum(call.get("latency_ms") or 0 for call in llm_calls), 2),
         }
+
+        _audit(
+            principal,
+            "query",
+            "data_source",
+            "failed" if execution_failed else "success",
+            resource_id=data_source_id,
+            request_id=request_id,
+            details={"intent": final_state.get("intent", ""), "retries": final_state.get("error_count", 0)},
+        )
 
         return {
             "code": 200,
@@ -213,6 +348,41 @@ async def query_database(request: QueryRequest):
                 }
             }
         }
+    except RequestTimedOut:
+        retain_pause_marker = True
+        observability_store.complete_request(
+            request_id=request_id,
+            status="timed_out",
+            latency_ms=(time.perf_counter() - started) * 1000,
+            retries=0,
+            error_message="Agent request exceeded the execution timeout",
+            technical_success=False,
+        )
+        _audit(principal, "query", "data_source", "timed_out", resource_id=data_source_id, request_id=request_id)
+        return {
+            "code": 504,
+            "data": {
+                "answer": "Request timed out. The workflow received a pause signal; narrow the query and retry.",
+                "metrics": {"request_id": request_id, "runtime_status": "timed_out"},
+            },
+        }
+    except RequestQueueFull:
+        observability_store.complete_request(
+            request_id=request_id,
+            status="queue_rejected",
+            latency_ms=(time.perf_counter() - started) * 1000,
+            retries=0,
+            error_message="Agent worker queue is full",
+            technical_success=False,
+        )
+        _audit(principal, "query", "data_source", "queue_rejected", resource_id=data_source_id, request_id=request_id)
+        return {
+            "code": 429,
+            "data": {
+                "answer": "The query queue is busy. Please retry shortly.",
+                "metrics": {"request_id": request_id, "runtime_status": "queue_rejected"},
+            },
+        }
     except RequestPaused:
         observability_store.complete_request(
             request_id=request_id,
@@ -220,7 +390,9 @@ async def query_database(request: QueryRequest):
             latency_ms=(time.perf_counter() - started) * 1000,
             retries=0,
             error_message="Request paused by user",
+            technical_success=False,
         )
+        _audit(principal, "query", "data_source", "paused", resource_id=data_source_id, request_id=request_id)
         return {"code": 499, "data": {"answer": "请求已暂停。", "metrics": {"request_id": request_id}}}
     except Exception as e:
         observability_store.complete_request(
@@ -229,7 +401,9 @@ async def query_database(request: QueryRequest):
             latency_ms=(time.perf_counter() - started) * 1000,
             retries=0,
             error_message=str(e),
+            technical_success=False,
         )
+        _audit(principal, "query", "data_source", "failed", resource_id=data_source_id, request_id=request_id, details={"error": str(e)})
         return {
             "code": 500,
             "data": {
@@ -238,21 +412,59 @@ async def query_database(request: QueryRequest):
             }
         }
     finally:
-        request_control.clear(request_id)
+        if not retain_pause_marker:
+            request_control.clear(request_id)
 
 
 @app.get("/api/v1/data-sources")
-async def list_data_sources():
-    return {"code": 200, "data": data_source_registry.list_enabled()}
+async def list_data_sources(principal: Principal = Depends(access_control.current_principal)):
+    sources = access_control.visible_sources(principal, data_source_registry.list_enabled())
+    _audit(principal, "list", "data_source", "success", details={"count": len(sources)})
+    return {"code": 200, "data": sources}
+
+
+@app.get("/api/v1/session")
+async def current_session(principal: Principal = Depends(access_control.current_principal)):
+    return {"code": 200, "data": principal.public()}
+
+
+@app.get("/api/v1/data-sources/{data_source_id}/health")
+async def check_data_source_health(data_source_id: str, principal: Principal = Depends(access_control.current_principal)):
+    """Probe one enabled direct connector without exposing its URI or credentials."""
+    try:
+        source = data_source_registry.resolve(data_source_id)
+    except DataSourceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _authorize_data_source(principal, data_source_id)
+
+    if source.get("execution_mode") != "direct":
+        return {
+            "code": 200,
+            "data": {
+                "data_source_id": data_source_id,
+                "healthy": None,
+                "detail": "Health probes are managed by the local SQLite or DuckDB federation runtime.",
+            },
+        }
+
+    try:
+        health = direct_connector_registry.connector_for(source).health_check()
+    except ConnectorError as exc:
+        health = {"healthy": False, "engine": source.get("engine"), "error": str(exc)}
+    return {"code": 200 if health.get("healthy") else 503, "data": {"data_source_id": data_source_id, **health}}
 
 
 @app.get("/api/v1/memory/preferences/{user_id}")
-async def get_user_preferences(user_id: str):
+async def get_user_preferences(user_id: str, principal: Principal = Depends(access_control.current_principal)):
+    access_control.require_self_or_admin(principal, user_id)
     return {"code": 200, "data": memory_store.get_preferences(user_id)}
 
 
 @app.put("/api/v1/memory/preferences/{user_id}")
-async def update_user_preferences(user_id: str, request: PreferenceUpdateRequest):
+async def update_user_preferences(
+    user_id: str, request: PreferenceUpdateRequest, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_self_or_admin(principal, user_id)
     updates = request.model_dump(exclude_none=True)
     data_source_id = updates.get("default_data_source_id")
     if data_source_id:
@@ -260,27 +472,106 @@ async def update_user_preferences(user_id: str, request: PreferenceUpdateRequest
             data_source_registry.resolve(data_source_id)
         except DataSourceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _authorize_data_source(principal, data_source_id)
     try:
-        return {"code": 200, "data": memory_store.update_preferences(user_id, updates)}
+        result = memory_store.update_preferences(user_id, updates)
+        _audit(principal, "update", "preferences", "success", resource_id=user_id)
+        return {"code": 200, "data": result}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.delete("/api/v1/memory/{user_id}")
-async def delete_user_memory(user_id: str):
+async def delete_user_memory(user_id: str, principal: Principal = Depends(access_control.current_principal)):
+    access_control.require_self_or_admin(principal, user_id)
     conversation = memory_store.delete_user_memory(user_id, include_preferences=True)
     semantic_count = semantic_memory_store.delete_all(user_id)
+    _audit(principal, "delete", "memory", "success", resource_id=user_id)
     return {"code": 200, "data": {**conversation, "semantic_memories": semantic_count}}
 
 
 @app.post("/api/v1/requests/{request_id}/pause")
-async def pause_request(request_id: str):
-    request_control.pause(request_id)
-    return {"code": 200, "data": {"request_id": request_id, "paused": True}}
+async def pause_request(request_id: str, principal: Principal = Depends(access_control.current_principal)):
+    _authorize_request_owner(principal, request_id)
+    queued = await request_runtime.pause(request_id)
+    _audit(principal, "pause", "request", "success", resource_id=request_id)
+    return {"code": 200, "data": {"request_id": request_id, "paused": True, "queued": queued}}
+
+
+@app.get("/api/v1/requests/{request_id}/status")
+async def request_status(request_id: str, principal: Principal = Depends(access_control.current_principal)):
+    _authorize_request_owner(principal, request_id)
+    status = request_runtime.status(request_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Request status not found")
+    return {"code": 200, "data": status}
+
+
+@app.get("/api/v1/requests/{request_id}/events")
+async def request_events(request_id: str, principal: Principal = Depends(access_control.current_principal)):
+    _authorize_request_owner(principal, request_id)
+    async def event_stream():
+        async for event in request_runtime.events(request_id):
+            yield f"event: {event['event']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/v1/requests/{request_id}/feedback")
+async def submit_request_feedback(
+    request_id: str, feedback: UserFeedbackRequest, principal: Principal = Depends(access_control.current_principal)
+):
+    _authorize_request_owner(principal, request_id)
+    observability_store.record_quality_feedback(
+        request_id, user_satisfied=feedback.satisfied, note=feedback.note
+    )
+    _audit(
+        principal,
+        "feedback",
+        "request",
+        "success",
+        resource_id=request_id,
+        details={"satisfied": feedback.satisfied},
+    )
+    return {"code": 200, "data": {"request_id": request_id, "satisfied": feedback.satisfied}}
+
+
+@app.post("/api/v1/requests/{request_id}/result-evaluation")
+async def evaluate_request_result(
+    request_id: str, evaluation: ResultEvaluationRequest, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_admin(principal)
+    if observability_store.get_request(request_id) is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    observability_store.record_quality_feedback(
+        request_id, result_correct=evaluation.correct, note=evaluation.note
+    )
+    _audit(
+        principal,
+        "result_evaluation",
+        "request",
+        "success",
+        resource_id=request_id,
+        details={"correct": evaluation.correct},
+    )
+    return {"code": 200, "data": {"request_id": request_id, "correct": evaluation.correct}}
 
 
 @app.get("/api/v1/memory/semantic")
-async def search_semantic_memory(user_id: str, query: str, data_source_id: str | None = None, limit: int = 4):
+async def search_semantic_memory(
+    user_id: str,
+    query: str,
+    data_source_id: str | None = None,
+    limit: int = 4,
+    principal: Principal = Depends(access_control.current_principal),
+):
+    access_control.require_self_or_admin(principal, user_id)
+    if data_source_id:
+        _authorize_data_source(principal, data_source_id)
     return {
         "code": 200,
         "data": semantic_memory_store.search(user_id, query, data_source_id, limit=limit),
@@ -288,7 +579,10 @@ async def search_semantic_memory(user_id: str, query: str, data_source_id: str |
 
 
 @app.post("/api/v1/memory/semantic/{user_id}")
-async def confirm_semantic_memory(user_id: str, request: SemanticMemoryRequest):
+async def confirm_semantic_memory(
+    user_id: str, request: SemanticMemoryRequest, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_self_or_admin(principal, user_id)
     if not request.confirmed:
         raise HTTPException(status_code=422, detail="Semantic memory must be explicitly confirmed")
     if request.data_source_scope:
@@ -296,6 +590,7 @@ async def confirm_semantic_memory(user_id: str, request: SemanticMemoryRequest):
             data_source_registry.resolve(request.data_source_scope)
         except DataSourceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _authorize_data_source(principal, request.data_source_scope)
     try:
         stored = semantic_memory_store.upsert(
             user_id=user_id,
@@ -312,29 +607,174 @@ async def confirm_semantic_memory(user_id: str, request: SemanticMemoryRequest):
             preferences = memory_store.get_preferences(user_id)
             aliases = {**preferences["metric_aliases"], request.label: request.definition}
             memory_store.update_preferences(user_id, {"metric_aliases": aliases})
+        _audit(principal, "create", "semantic_memory", "success", resource_id=stored.get("memory_id"))
         return {"code": 200, "data": stored}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.delete("/api/v1/memory/semantic/{user_id}/{memory_id}")
-async def delete_semantic_memory(user_id: str, memory_id: str):
+async def delete_semantic_memory(
+    user_id: str, memory_id: str, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_self_or_admin(principal, user_id)
     if not semantic_memory_store.delete(user_id, memory_id):
         raise HTTPException(status_code=404, detail="Semantic memory not found")
+    _audit(principal, "delete", "semantic_memory", "success", resource_id=memory_id)
     return {"code": 200, "data": {"deleted": True}}
 
 
 @app.get("/api/v1/observability/summary")
-async def observability_summary(window_hours: int = 24):
+async def observability_summary(
+    window_hours: int = 24, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_admin(principal)
+    _audit(principal, "read", "observability_summary", "success")
     return {"code": 200, "data": observability_store.summary(window_hours)}
 
 
 @app.get("/api/v1/observability/requests/{request_id}")
-async def observability_request(request_id: str):
+async def observability_request(request_id: str, principal: Principal = Depends(access_control.current_principal)):
     data = observability_store.get_request(request_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Observability request not found")
+    access_control.require_self_or_admin(principal, str(data["request"].get("user_id", "")))
+    _audit(principal, "read", "observability_request", "success", resource_id=request_id)
     return {"code": 200, "data": data}
+
+
+@app.get("/api/v1/audit-events")
+async def audit_events(limit: int = 100, principal: Principal = Depends(access_control.current_principal)):
+    access_control.require_admin(principal)
+    _audit(principal, "read", "audit_log", "success", details={"limit": limit})
+    return {"code": 200, "data": observability_store.list_audit_events(limit=limit)}
+
+
+@app.get("/api/v1/evaluation/cases")
+async def evaluation_cases(
+    include_extended: bool = False, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_admin(principal)
+    try:
+        suite_name, cases = load_golden_cases(Path(BASE_DIR), include_extended=include_extended)
+    except (OSError, EvaluationCaseError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    _audit(principal, "read", "evaluation_cases", "success", details={"count": len(cases)})
+    return {"code": 200, "data": {"suite_name": suite_name, "cases": cases}}
+
+
+@app.post("/api/v1/evaluation/run")
+async def run_evaluation(
+    request: EvaluationRunRequest, principal: Principal = Depends(access_control.current_principal)
+):
+    access_control.require_admin(principal)
+    try:
+        suite_name, cases = load_golden_cases(Path(BASE_DIR), include_extended=request.include_extended)
+    except (OSError, EvaluationCaseError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if request.case_ids:
+        requested_ids = set(request.case_ids)
+        cases = [case for case in cases if str(case["id"]) in requested_ids]
+        if len(cases) != len(requested_ids):
+            raise HTTPException(status_code=422, detail="One or more evaluation case ids are unavailable")
+    if not cases:
+        raise HTTPException(status_code=422, detail="No evaluation cases selected")
+
+    run_id = f"eval-{uuid4().hex}"
+    observability_store.start_evaluation_run(run_id, suite_name, len(cases))
+    passed_cases = 0
+    results: list[dict[str, object]] = []
+    for case in cases:
+        case_id = str(case["id"])
+        request_id = f"{run_id}-{case_id}"
+        try:
+            data_source_id = str(case.get("data_source_id", "sqlite_local"))
+            _authorize_data_source(principal, data_source_id)
+            source = data_source_registry.resolve(data_source_id)
+            observability_store.start_request(
+                request_id,
+                principal.user_id,
+                str(case["query"]),
+                str(source["execution_mode"]),
+                data_source_id=data_source_id,
+                tenant_id=principal.tenant_id,
+                role=principal.role,
+                is_evaluation=True,
+            )
+            initial_state = {
+                "messages": [HumanMessage(content=str(case["query"]))],
+                "request_id": request_id,
+                "user_id": principal.user_id,
+                "principal": principal,
+                "data_source_id": data_source_id,
+                "target_db_type": str(source["execution_mode"]),
+                "conversation_context": [],
+                "user_preferences": {},
+                "memory_enabled": False,
+                "error_count": 0,
+                "similarity_threshold": 0.8,
+            }
+            final_state = await request_runtime.submit(request_id, lambda: agent_app.invoke(initial_state))
+            execution_failed = final_state.get("execution_result", "").startswith("ERROR:") or final_state.get(
+                "validation_result", ""
+            ).startswith("ERROR:")
+            is_sql_request = final_state.get("intent") in {"text_to_sql", "data_analysis"}
+            sql_executable = (
+                bool(final_state.get("generated_sql"))
+                and final_state.get("validation_result") == "VALID"
+                and not execution_failed
+            ) if is_sql_request else None
+            score = score_final_state(case, final_state)
+            observability_store.complete_request(
+                request_id,
+                "failed" if execution_failed else "success",
+                0,
+                int(final_state.get("error_count", 0)),
+                final_state.get("execution_result") if execution_failed else None,
+                technical_success=not execution_failed,
+                sql_executable=sql_executable,
+            )
+            observability_store.record_evaluation_case(
+                run_id,
+                case_id,
+                str(score["status"]),
+                request_id=request_id,
+                intent_expected=str(score["intent_expected"]),
+                intent_actual=str(score["intent_actual"]),
+                intent_correct=bool(score["intent_correct"]),
+                sql_executable=score["sql_executable"],
+                result_correct=score["result_correct"],
+                details=score["details"],
+            )
+            if score["status"] == "passed":
+                passed_cases += 1
+            results.append({"case_id": case_id, **score})
+        except Exception as exc:
+            observability_store.complete_request(
+                request_id, "failed", 0, 0, str(exc), technical_success=False
+            )
+            observability_store.record_evaluation_case(
+                run_id, case_id, "error", request_id=request_id, details={"error": str(exc)}
+            )
+            results.append({"case_id": case_id, "status": "error", "details": {"error": str(exc)}})
+
+    summary = {
+        "total_cases": len(cases),
+        "passed_cases": passed_cases,
+        "pass_rate": round(passed_cases / len(cases) * 100, 2),
+    }
+    observability_store.complete_evaluation_run(run_id, passed_cases, summary)
+    _audit(principal, "run", "evaluation", "success", resource_id=run_id, details=summary)
+    return {"code": 200, "data": {"run_id": run_id, "summary": summary, "results": results}}
+
+
+@app.get("/api/v1/evaluation/runs/{run_id}")
+async def evaluation_run(run_id: str, principal: Principal = Depends(access_control.current_principal)):
+    access_control.require_admin(principal)
+    result = observability_store.get_evaluation_run(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Evaluation run not found")
+    return {"code": 200, "data": result}
 
 
 def _resolve_frontend_dist_dir():

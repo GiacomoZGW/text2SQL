@@ -1,0 +1,54 @@
+auth:
+  # Local development keeps the demo usable. Production must set DATA_AGENT_AUTH_MODE=api_key.
+  default_mode: development
+  development_user_id: test_user_001
+
+roles:
+  admin:
+    admin: true
+    data_sources: ["*"]
+    table_access:
+      "*":
+        tables: ["*"]
+        columns:
+          "*": ["*"]
+
+  analyst:
+    admin: false
+    data_sources: [sqlite_local, federated_demo]
+    table_access:
+      sqlite_local:
+        tables: [orders, users, products]
+        columns:
+          orders: [id, user_id, product_id, total_amount, category, created_at]
+          users: [id, name, city, created_at]
+          products: [id, name, category, price]
+      federated_demo:
+        tables: ["*"]
+        columns:
+          "*": ["*"]
+
+principals:
+  - user_id: test_user_001
+    role: admin
+    tenant_id: local_demo
+  - user_id: analyst_001
+    role: analyst
+    tenant_id: tenant_a
+    api_key_env: DATA_AGENT_ANALYST_API_KEY
+  - user_id: admin_001
+    role: admin
+    tenant_id: platform
+    api_key_env: DATA_AGENT_ADMIN_API_KEY
+
+# Enable a source only after its schema includes the configured tenant column on every protected table.
+tenant_isolation:
+  mysql_business:
+    enabled: true
+    column: tenant_id
+  postgres_logs:
+    enabled: true
+    column: tenant_id
+  clickhouse_features:
+    enabled: true
+    column: tenant_id

@@ -35,7 +35,7 @@ class DataSourceRegistry:
             if source.get("enabled") is not True:
                 raise DataSourceError(f"Data source is not enabled: {data_source_id}")
             execution_mode = str(source.get("execution_mode", "")).lower()
-            if execution_mode not in {"sqlite", "federated"}:
+            if execution_mode not in {"sqlite", "federated", "direct"}:
                 raise DataSourceError(f"Unsupported execution mode for {data_source_id}")
             return source
         raise DataSourceError(f"Unknown data source: {data_source_id}")

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Send, Database, LayoutDashboard, Settings, Loader2,
-  Code2, TerminalSquare, AlertCircle, CheckCircle2, User, Bot, Sparkles, Server, FileJson, BarChart3, ShieldCheck, BrainCircuit, Pause, RotateCcw, Trash2
+  Code2, TerminalSquare, AlertCircle, CheckCircle2, User, Bot, Sparkles, Server, FileJson, BarChart3, ShieldCheck, BrainCircuit, Pause, RotateCcw, Trash2, ThumbsUp, ThumbsDown
 } from 'lucide-react';
 import { fetchDemoQuery } from './demoMock.js';
 import TokenMonitor from './TokenMonitor.jsx';
@@ -9,6 +9,11 @@ import TokenMonitor from './TokenMonitor.jsx';
 const DEMO_STORAGE_KEY = 'text2sql_offline_demo';
 const CONVERSATION_STORAGE_KEY = 'text2sql_conversation_id';
 const USER_ID = 'test_user_001';
+
+function apiHeaders(extra = {}) {
+  const apiKey = import.meta.env.VITE_DATA_AGENT_API_KEY;
+  return apiKey ? { ...extra, 'X-API-Key': apiKey } : extra;
+}
 
 function readDemoModeInitial() {
   try {
@@ -75,6 +80,7 @@ const Chat = () => {
   const [dataSourceId, setDataSourceId] = useState('');
   const [dataSourceError, setDataSourceError] = useState('');
   const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState(USER_ID);
   const [memoryUpdating, setMemoryUpdating] = useState(false);
   const [clarificationParentRequestId, setClarificationParentRequestId] = useState('');
   const [conversationId] = useState(readConversationId);
@@ -82,6 +88,7 @@ const Chat = () => {
   const [monitorSummary, setMonitorSummary] = useState(null);
   const [monitorLoading, setMonitorLoading] = useState(false);
   const [monitorError, setMonitorError] = useState('');
+  const [feedbackByRequest, setFeedbackByRequest] = useState({});
   const messagesEndRef = useRef(null);
   const abortControllerRef = useRef(null);
   const activeRequestIdRef = useRef('');
@@ -93,7 +100,7 @@ const Chat = () => {
     setMonitorLoading(true);
     setMonitorError('');
     try {
-      const response = await fetch(apiUrl('/api/v1/observability/summary?window_hours=24'));
+      const response = await fetch(apiUrl('/api/v1/observability/summary?window_hours=24'), { headers: apiHeaders() });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const payload = await response.json();
       if (payload.code !== 200) throw new Error('监控接口返回异常');
@@ -109,11 +116,11 @@ const Chat = () => {
   const loadDataSources = async () => {
     setDataSourceError('');
     try {
-      const response = await fetch(apiUrl('/api/v1/data-sources'));
+      const response = await fetch(apiUrl('/api/v1/data-sources'), { headers: apiHeaders() });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const payload = await response.json();
       if (payload.code !== 200 || !Array.isArray(payload.data)) throw new Error('数据源接口返回异常');
-      const preferenceResponse = await fetch(apiUrl(`/api/v1/memory/preferences/${USER_ID}`));
+      const preferenceResponse = await fetch(apiUrl(`/api/v1/memory/preferences/${currentUserId}`), { headers: apiHeaders() });
       const preferencePayload = preferenceResponse.ok ? await preferenceResponse.json() : { data: {} };
       const preferredSourceId = preferencePayload.data?.default_data_source_id;
       setMemoryEnabled(preferencePayload.data?.memory_enabled !== false);
@@ -127,12 +134,23 @@ const Chat = () => {
     }
   };
 
+  const loadSession = async () => {
+    try {
+      const response = await fetch(apiUrl('/api/v1/session'), { headers: apiHeaders() });
+      if (!response.ok) return;
+      const payload = await response.json();
+      if (payload.code === 200 && payload.data?.user_id) setCurrentUserId(payload.data.user_id);
+    } catch {
+      /* Keep the local development identity when the API is unavailable. */
+    }
+  };
+
   const updateMemoryEnabled = async (next) => {
     setMemoryUpdating(true);
     try {
-      const response = await fetch(apiUrl(`/api/v1/memory/preferences/${USER_ID}`), {
+      const response = await fetch(apiUrl(`/api/v1/memory/preferences/${currentUserId}`), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ memory_enabled: next })
       });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -150,7 +168,10 @@ const Chat = () => {
     if (!window.confirm('确认删除当前用户的会话、语义和偏好记忆吗？')) return;
     setMemoryUpdating(true);
     try {
-      const response = await fetch(apiUrl(`/api/v1/memory/${USER_ID}`), { method: 'DELETE' });
+      const response = await fetch(apiUrl(`/api/v1/memory/${currentUserId}`), {
+        method: 'DELETE',
+        headers: apiHeaders()
+      });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       setClarificationParentRequestId('');
       setMemoryEnabled(true);
@@ -171,7 +192,7 @@ const Chat = () => {
     pauseRequestedRef.current = true;
     const requestId = activeRequestIdRef.current;
     if (requestId) {
-      fetch(apiUrl(`/api/v1/requests/${requestId}/pause`), { method: 'POST' }).catch(() => {});
+      fetch(apiUrl(`/api/v1/requests/${requestId}/pause`), { method: 'POST', headers: apiHeaders() }).catch(() => {});
     }
     abortControllerRef.current?.abort();
     clearProcessingTimers();
@@ -183,6 +204,22 @@ const Chat = () => {
       steps: []
     } : message));
     setIsProcessing(false);
+  };
+
+  const submitFeedback = async (requestId, satisfied) => {
+    if (!requestId || feedbackByRequest[requestId]) return;
+    setFeedbackByRequest((current) => ({ ...current, [requestId]: 'sending' }));
+    try {
+      const response = await fetch(apiUrl(`/api/v1/requests/${requestId}/feedback`), {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ satisfied })
+      });
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      setFeedbackByRequest((current) => ({ ...current, [requestId]: satisfied ? 'up' : 'down' }));
+    } catch (error) {
+      setFeedbackByRequest((current) => ({ ...current, [requestId]: 'error' }));
+    }
   };
 
   const persistDemoMode = (next) => {
@@ -202,8 +239,12 @@ const Chat = () => {
   }, [demoMode]);
 
   useEffect(() => {
-    loadDataSources();
+    loadSession();
   }, [demoMode]);
+
+  useEffect(() => {
+    loadDataSources();
+  }, [demoMode, currentUserId]);
 
   const quickExamples = [
     { icon: "📊", title: "统计各商品类别的销售总额", prompt: "统计一下各商品类别的销售总额，并按金额降序排列" },
@@ -297,9 +338,8 @@ const Chat = () => {
       } else {
         const response = await fetch(queryUrl(), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
-            user_id: USER_ID,
             query: userText,
             data_source_id: dataSourceId || undefined,
             conversation_id: conversationId,
@@ -336,6 +376,7 @@ const Chat = () => {
             status: 'completed',
             content: resData.data.answer,
             sql: resData.data.metrics?.executed_sql || null,
+            requestId,
             steps: []
           } : msg
         ));
@@ -640,6 +681,29 @@ const Chat = () => {
                         {msg.status === 'completed' && index > 0 && (
                           <div className="bg-white border border-slate-200 px-6 py-5 rounded-2xl shadow-sm text-[15px] text-slate-800 leading-relaxed whitespace-pre-wrap">
                             {msg.content}
+                            {msg.requestId && !demoMode && (
+                              <div className="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                                <span>结果是否有帮助？</span>
+                                <button
+                                  type="button"
+                                  onClick={() => submitFeedback(msg.requestId, true)}
+                                  disabled={feedbackByRequest[msg.requestId] === 'sending'}
+                                  title="满意"
+                                  className={`inline-flex h-7 w-7 items-center justify-center rounded border ${feedbackByRequest[msg.requestId] === 'up' ? 'border-emerald-300 bg-emerald-50 text-emerald-600' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                                >
+                                  <ThumbsUp className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => submitFeedback(msg.requestId, false)}
+                                  disabled={feedbackByRequest[msg.requestId] === 'sending'}
+                                  title="不满意"
+                                  className={`inline-flex h-7 w-7 items-center justify-center rounded border ${feedbackByRequest[msg.requestId] === 'down' ? 'border-rose-300 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                                >
+                                  <ThumbsDown className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            )}
                           </div>
                         )}
 

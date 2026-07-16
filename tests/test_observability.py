@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from observability.store import ObservabilityStore
@@ -79,6 +80,51 @@ class ObservabilityStoreTests(unittest.TestCase):
             self.assertEqual(summary["intent"]["classification"]["clarification_resolved_count"], 1)
             self.assertEqual(summary["intent"]["llm"]["total_tokens"], 12)
             self.assertEqual(summary["intent"]["routes"][0]["route"], "clarification")
+
+    def test_audit_events_record_actor_and_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ObservabilityStore(Path(temp_dir) / "observability.db")
+            store.record_audit_event(
+                user_id="user-1",
+                tenant_id="tenant-a",
+                role="analyst",
+                action="query",
+                resource_type="data_source",
+                resource_id="sqlite_local",
+                outcome="success",
+                request_id="request-1",
+                details={"intent": "text_to_sql"},
+            )
+
+            event = store.list_audit_events(limit=1)[0]
+            self.assertEqual(event["user_id"], "user-1")
+            self.assertEqual(event["outcome"], "success")
+            self.assertEqual(event["details"], {"intent": "text_to_sql"})
+
+    def test_running_and_aborted_requests_are_excluded_from_technical_success_rate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ObservabilityStore(Path(temp_dir) / "observability.db")
+            store.start_request("successful", "user-1", "hello", "sqlite")
+            store.complete_request("successful", "success", 10, 0, technical_success=True)
+            store.record_quality_feedback("successful", result_correct=True, user_satisfied=True)
+
+            store.start_request("stale", "user-1", "hello", "sqlite")
+            connection = store._connect()
+            try:
+                stale_started_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+                connection.execute("UPDATE requests SET started_at = ? WHERE request_id = 'stale'", (stale_started_at,))
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(store.reconcile_stale_running_requests(max_age_seconds=30), 1)
+            summary = store.summary()
+
+            self.assertEqual(summary["requests"]["terminal_count"], 1)
+            self.assertEqual(summary["requests"]["aborted_count"], 1)
+            self.assertEqual(summary["requests"]["technical_success_rate"], 100.0)
+            self.assertEqual(summary["requests"]["result_correct_rate"], 100.0)
+            self.assertEqual(summary["requests"]["satisfaction_rate"], 100.0)
 
 
 if __name__ == "__main__":

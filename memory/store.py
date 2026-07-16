@@ -164,19 +164,30 @@ class MemoryStore:
         finally:
             connection.close()
 
-    def get_conversation_context(self, conversation_id: str | None, limit: int = 4) -> list[dict[str, Any]]:
+    def get_conversation_context(
+        self, conversation_id: str | None, limit: int = 4, user_id: str | None = None
+    ) -> list[dict[str, Any]]:
         if not conversation_id:
             return []
         self.purge_expired()
         connection = self._connect()
         try:
-            rows = connection.execute(
-                """
-                SELECT user_query, intent, entities_json, answer_summary, data_source_id, created_at
-                FROM conversation_turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?
-                """,
-                (conversation_id, max(1, min(limit, 10))),
-            ).fetchall()
+            if user_id:
+                rows = connection.execute(
+                    """
+                    SELECT user_query, intent, entities_json, answer_summary, data_source_id, created_at
+                    FROM conversation_turns WHERE conversation_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?
+                    """,
+                    (conversation_id, user_id, max(1, min(limit, 10))),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT user_query, intent, entities_json, answer_summary, data_source_id, created_at
+                    FROM conversation_turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?
+                    """,
+                    (conversation_id, max(1, min(limit, 10))),
+                ).fetchall()
             context = []
             for row in reversed(rows):
                 entities = json.loads(row["entities_json"] or "{}")

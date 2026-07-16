@@ -30,7 +30,7 @@ class SchemaIndexerTests(unittest.TestCase):
     def test_embedding_failure_uses_lexical_memory_without_chroma(self, embeddings_class):
         embeddings_class.return_value.embed_documents.side_effect = RuntimeError("embedding unavailable")
 
-        result = schema_indexer.retrieve_relevant_schema("city", "sqlite", self.schema)
+        result = schema_indexer.retrieve_relevant_schema("city", "sqlite_lexical", self.schema)
 
         self.assertEqual(result["source"], "lexical_memory")
         self.assertEqual(result["tables"][0], "users")

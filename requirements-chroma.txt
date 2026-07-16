@@ -1,0 +1,4 @@
+# Chroma is deliberately opt-in. The default schema backend is dashscope_memory.
+-r requirements.txt
+chromadb==1.5.5
+langchain-chroma==1.1.0

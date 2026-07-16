@@ -1,0 +1,42 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MEMORY_DB_PATH: /var/lib/data-agent/memory.db
+      OBSERVABILITY_DB_PATH: /var/lib/data-agent/observability.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - agent_state:/var/lib/data-agent
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  agent_state:
+  redis_data:
