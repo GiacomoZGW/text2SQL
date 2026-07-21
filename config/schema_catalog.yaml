@@ -1,0 +1,40 @@
+version: "1"
+
+# Business metadata is deliberately separate from live database credentials. It is
+# safe to version, review, and extend as real data sources are introduced.
+data_sources:
+  sqlite_local:
+    version: "ecommerce-demo-1"
+    tables:
+      orders:
+        description: Ecommerce purchase records at order-line granularity.
+        aliases: [order, orders, purchase, sales, transaction]
+        columns:
+          user_id:
+            description: Stable purchaser identifier.
+            aliases: [user, customer, buyer]
+          product_id:
+            description: Purchased product identifier.
+            aliases: [product, sku, item]
+          category:
+            description: Product category selected at purchase time.
+            aliases: [category, product_category]
+          total_amount:
+            description: Gross monetary value of the order line.
+            aliases: [gmv, revenue, sales_amount, amount]
+          purchase_time:
+            description: Order creation time.
+            aliases: [order_time, date, time]
+          city:
+            description: Purchaser city.
+            aliases: [region, location]
+    relationships: []
+    metrics:
+      gmv:
+        definition: SUM(orders.total_amount), gross merchandise value.
+        aliases: [sales, revenue, transaction_amount]
+      active_users:
+        definition: COUNT(DISTINCT orders.user_id) over a requested time range.
+        aliases: [active buyer, active customer]
+    permissions:
+      classification: internal_demo

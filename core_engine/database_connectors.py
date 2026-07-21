@@ -206,17 +206,39 @@ class SqlAlchemyConnector:
                 columns = inspector.get_columns(table_name, schema=self.settings.schema)
                 column_text = ", ".join(f"{column['name']} ({column['type']})" for column in columns)
                 qualified_name = f"{self.settings.schema}.{table_name}" if self.settings.schema else table_name
-                schema_lines.append(f"Table: {qualified_name}\nColumns: {column_text}")
+                lines = [f"Table: {qualified_name}"]
+                try:
+                    comment = inspector.get_table_comment(table_name, schema=self.settings.schema).get("text")
+                except (NotImplementedError, SQLAlchemyError):
+                    comment = None
+                if comment:
+                    lines.append(f"Description: {comment}")
+                lines.append(f"Columns: {column_text}")
+                try:
+                    foreign_keys = inspector.get_foreign_keys(table_name, schema=self.settings.schema)
+                except (NotImplementedError, SQLAlchemyError):
+                    foreign_keys = []
+                relations = []
+                for foreign_key in foreign_keys:
+                    referred_table = str(foreign_key.get("referred_table") or "")
+                    for local_column, remote_column in zip(
+                        foreign_key.get("constrained_columns", []), foreign_key.get("referred_columns", [])
+                    ):
+                        if referred_table:
+                            relations.append(f"{qualified_name}.{local_column} -> {referred_table}.{remote_column}")
+                if relations:
+                    lines.append("Foreign Keys: " + "; ".join(relations))
+                schema_lines.append("\n".join(lines))
             return "\n\n".join(schema_lines)
         except SQLAlchemyError as exc:
             raise ConnectorError(f"Unable to read schema for {self.settings.data_source_id}: {exc}") from exc
 
-    def explain(self, sql: str) -> None:
+    def explain(self, sql: str) -> list[tuple[Any, ...]]:
         safe_sql = assert_read_only_sql(sql)
         try:
             with self._connection() as connection:
                 self._configure_read_only_session(connection)
-                connection.execute(text(f"EXPLAIN {safe_sql}")).fetchmany(1)
+                return [tuple(row) for row in connection.execute(text(f"EXPLAIN {safe_sql}")).fetchmany(50)]
         except SQLAlchemyError as exc:
             raise ConnectorError(f"Direct SQL preflight failed: {exc}") from exc
 

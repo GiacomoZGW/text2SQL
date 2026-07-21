@@ -85,6 +85,34 @@ class SharedState:
         with self._lock:
             self._memory.pop(key, None)
 
+    def increment(self, key: str, ttl_seconds: int) -> int:
+        """Increment a short-lived counter in Redis or the local fallback."""
+        ttl_seconds = max(1, int(ttl_seconds))
+        client = self._client()
+        if client is not None:
+            try:
+                pipeline = client.pipeline(transaction=True)
+                pipeline.incr(self._key(key))
+                pipeline.ttl(self._key(key))
+                count, remaining_ttl = pipeline.execute()
+                if int(remaining_ttl) < 0:
+                    client.expire(self._key(key), ttl_seconds)
+                return int(count)
+            except Exception:
+                self._redis = None
+                self._redis_retry_after = time.monotonic() + 30
+        with self._lock:
+            cached = self._memory.get(key)
+            now = time.monotonic()
+            if cached is None or now >= cached[0]:
+                count = 1
+                expires_at = now + ttl_seconds
+            else:
+                expires_at, value = cached
+                count = int(value) + 1
+            self._memory[key] = (expires_at, str(count))
+            return count
+
     def set_json(self, key: str, value: Any, ttl_seconds: int) -> None:
         self.set_text(key, json.dumps(value, ensure_ascii=False, separators=(",", ":")), ttl_seconds)
 

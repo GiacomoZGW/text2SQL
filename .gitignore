@@ -217,7 +217,9 @@ __marimo__/
 # ========================
 frontend/node_modules/
 frontend/dist/
+frontend/test-results/
 dist_package/
+artifacts/
 .DS_Store
 *.mp4
 vector_store/.chroma_runtime/

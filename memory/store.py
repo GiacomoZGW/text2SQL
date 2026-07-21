@@ -7,9 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from core_engine.runtime_storage import RuntimeStorage
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "memory.db"
 DEFAULT_RETENTION_DAYS = 30
+DEFAULT_HOT_CONTEXT_CHARS = 6_000
+DEFAULT_HOT_CONTEXT_MAX_TURNS = 12
 
 
 def _utc_now() -> str:
@@ -20,13 +24,12 @@ class MemoryStore:
     def __init__(self, db_path: Path | str | None = None, retention_days: int | None = None):
         self.db_path = Path(db_path or os.getenv("MEMORY_DB_PATH", DEFAULT_DB_PATH))
         self.retention_days = max(1, int(retention_days or os.getenv("MEMORY_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        database_url = None if db_path is not None else os.getenv("MEMORY_DATABASE_URL") or os.getenv("RUNTIME_DATABASE_URL")
+        self._storage = RuntimeStorage(self.db_path, database_url)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
+    def _connect(self):
+        return self._storage.connect()
 
     def _initialize(self) -> None:
         connection = self._connect()
@@ -60,9 +63,20 @@ class MemoryStore:
                     ON conversation_turns(conversation_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_memory_turns_created_at
                     ON conversation_turns(created_at);
+
+                CREATE TABLE IF NOT EXISTS conversation_checkpoints (
+                    conversation_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (conversation_id, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_checkpoints_updated_at
+                    ON conversation_checkpoints(updated_at);
                 """
             )
-            self._ensure_preference_columns(connection)
+            if not self._storage.is_postgres:
+                self._ensure_preference_columns(connection)
             connection.commit()
         finally:
             connection.close()
@@ -78,6 +92,7 @@ class MemoryStore:
         connection = self._connect()
         try:
             connection.execute("DELETE FROM conversation_turns WHERE created_at < ?", (cutoff,))
+            connection.execute("DELETE FROM conversation_checkpoints WHERE updated_at < ?", (cutoff,))
             connection.commit()
         finally:
             connection.close()
@@ -156,11 +171,18 @@ class MemoryStore:
         connection = self._connect()
         try:
             turn_count = connection.execute("DELETE FROM conversation_turns WHERE user_id = ?", (user_id,)).rowcount
+            checkpoint_count = connection.execute(
+                "DELETE FROM conversation_checkpoints WHERE user_id = ?", (user_id,)
+            ).rowcount
             preference_count = 0
             if include_preferences:
                 preference_count = connection.execute("DELETE FROM user_preferences WHERE user_id = ?", (user_id,)).rowcount
             connection.commit()
-            return {"conversation_turns": turn_count, "preferences": preference_count}
+            return {
+                "conversation_turns": turn_count,
+                "conversation_checkpoints": checkpoint_count,
+                "preferences": preference_count,
+            }
         finally:
             connection.close()
 
@@ -205,6 +227,121 @@ class MemoryStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _row_to_turn(row: sqlite3.Row) -> dict[str, Any]:
+        entities = json.loads(row["entities_json"] or "{}")
+        return {
+            "user_query": row["user_query"],
+            "intent": row["intent"],
+            "entities": entities if isinstance(entities, dict) else {},
+            "answer_summary": row["answer_summary"] or "",
+            "data_source_id": row["data_source_id"],
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _hot_context_config() -> tuple[int, int]:
+        try:
+            char_budget = int(os.getenv("CONTEXT_HOT_HISTORY_MAX_CHARS", str(DEFAULT_HOT_CONTEXT_CHARS)))
+        except ValueError:
+            char_budget = DEFAULT_HOT_CONTEXT_CHARS
+        try:
+            max_turns = int(os.getenv("CONTEXT_HOT_HISTORY_MAX_TURNS", str(DEFAULT_HOT_CONTEXT_MAX_TURNS)))
+        except ValueError:
+            max_turns = DEFAULT_HOT_CONTEXT_MAX_TURNS
+        return max(1_000, char_budget), max(1, min(max_turns, 30))
+
+    def get_hot_context(
+        self,
+        conversation_id: str | None,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """Return a budgeted recent-turn window plus a durable task checkpoint."""
+        empty = {
+            "recent_turns": [],
+            "checkpoint": {},
+            "metadata": {
+                "available_turns": 0,
+                "selected_turns": 0,
+                "char_budget": 0,
+                "used_chars": 0,
+                "older_turns_omitted": False,
+            },
+        }
+        if not conversation_id:
+            return empty
+
+        self.purge_expired()
+        char_budget, max_turns = self._hot_context_config()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT user_query, intent, entities_json, answer_summary, data_source_id, created_at
+                FROM conversation_turns
+                WHERE conversation_id = ? AND user_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (conversation_id, user_id, max_turns),
+            ).fetchall()
+            total = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM conversation_turns
+                WHERE conversation_id = ? AND user_id = ?
+                """,
+                (conversation_id, user_id),
+            ).fetchone()["count"]
+            checkpoint_row = connection.execute(
+                """
+                SELECT checkpoint_json FROM conversation_checkpoints
+                WHERE conversation_id = ? AND user_id = ?
+                """,
+                (conversation_id, user_id),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        checkpoint: dict[str, Any] = {}
+        if checkpoint_row:
+            try:
+                parsed = json.loads(checkpoint_row["checkpoint_json"])
+                checkpoint = parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                checkpoint = {}
+
+        selected: list[dict[str, Any]] = []
+        used_chars = 0
+        for row in rows:
+            turn = self._row_to_turn(row)
+            turn_chars = len(json.dumps(turn, ensure_ascii=False, default=str))
+            if selected and used_chars + turn_chars > char_budget:
+                break
+            selected.append(turn)
+            used_chars += turn_chars
+
+        selected.reverse()
+        return {
+            "recent_turns": selected,
+            "checkpoint": checkpoint,
+            "metadata": {
+                "available_turns": total,
+                "selected_turns": len(selected),
+                "char_budget": char_budget,
+                "used_chars": used_chars,
+                "older_turns_omitted": total > len(selected),
+            },
+        }
+
+    @staticmethod
+    def _checkpoint_entities(entities: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(entities, dict):
+            return {}
+        return {
+            str(key)[:100]: value
+            for key, value in entities.items()
+            if value not in (None, "", [], {})
+        }
+
     def record_turn(
         self,
         conversation_id: str | None,
@@ -214,6 +351,9 @@ class MemoryStore:
         intent: str,
         entities: dict[str, Any] | None,
         answer: str,
+        generated_sql: str = "",
+        execution_failed: bool = False,
+        error_detail: str = "",
     ) -> None:
         if not conversation_id:
             return
@@ -237,6 +377,59 @@ class MemoryStore:
                     json.dumps(entities or {}, ensure_ascii=False),
                     answer_summary,
                     _utc_now(),
+                ),
+            )
+            checkpoint_row = connection.execute(
+                """
+                SELECT checkpoint_json FROM conversation_checkpoints
+                WHERE conversation_id = ? AND user_id = ?
+                """,
+                (conversation_id, user_id),
+            ).fetchone()
+            checkpoint: dict[str, Any] = {}
+            if checkpoint_row:
+                try:
+                    parsed = json.loads(checkpoint_row["checkpoint_json"])
+                    checkpoint = parsed if isinstance(parsed, dict) else {}
+                except json.JSONDecodeError:
+                    checkpoint = {}
+
+            checkpoint.update(
+                {
+                    "version": 1,
+                    "active_data_source_id": data_source_id,
+                    "latest_intent": intent[:80],
+                    "latest_user_query": user_query[:1_000],
+                    "latest_answer_summary": answer_summary,
+                    "updated_at": _utc_now(),
+                }
+            )
+            entity_snapshot = self._checkpoint_entities(entities)
+            if entity_snapshot:
+                prior_entities = checkpoint.get("confirmed_entities")
+                merged_entities = dict(prior_entities) if isinstance(prior_entities, dict) else {}
+                merged_entities.update(entity_snapshot)
+                checkpoint["confirmed_entities"] = merged_entities
+            if not execution_failed and generated_sql.strip():
+                checkpoint["last_successful_sql"] = generated_sql[:4_000]
+                checkpoint.pop("last_error", None)
+            elif execution_failed:
+                checkpoint["last_error"] = (error_detail or answer_summary)[:2_000]
+
+            connection.execute(
+                """
+                INSERT INTO conversation_checkpoints (
+                    conversation_id, user_id, checkpoint_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id, user_id) DO UPDATE SET
+                    checkpoint_json = excluded.checkpoint_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_id,
+                    user_id,
+                    json.dumps(checkpoint, ensure_ascii=False),
+                    checkpoint["updated_at"],
                 ),
             )
             connection.commit()

@@ -26,3 +26,11 @@ GET  /api/v1/evaluation/runs/{run_id}
 ```
 
 The default suite contains stable, local-rule cases. Pass `{"include_extended": true}` to include SQL cases that can invoke the configured model and database. Evaluation requests and Agent events are flagged separately and excluded from production dashboard calculations.
+
+For CI and release gates, run the deterministic subset without model credentials:
+
+```text
+python scripts/run_evaluation.py --offline --output artifacts/evaluation.json
+```
+
+The generated report separates intent accuracy, SQL executable rate, result correctness, and category-level pass counts. Run the extended suite in a protected environment after any prompt, model, Schema Catalog, connector, or authorization-policy change.

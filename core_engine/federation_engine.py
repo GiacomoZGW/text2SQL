@@ -137,10 +137,10 @@ class DuckDBFederationEngine:
         finally:
             connection.close()
 
-    def explain(self, sql: str) -> None:
+    def explain(self, sql: str) -> list[tuple[Any, ...]]:
         connection, _ = self.connect()
         try:
-            connection.execute(f"EXPLAIN {sql}").fetchall()
+            return connection.execute(f"EXPLAIN {sql}").fetchall()
         except duckdb.Error as exc:
             raise FederationError(f"DuckDB 联邦 SQL 预检失败: {exc}") from exc
         finally:

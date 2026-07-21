@@ -8,6 +8,14 @@ services:
         required: false
     environment:
       REDIS_URL: redis://redis:6379/0
+      TASK_EXECUTION_MODE: redis_streams
+      HTTP_PROXY: ${CONTAINER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${CONTAINER_HTTPS_PROXY:-}
+      http_proxy: ${CONTAINER_HTTP_PROXY:-}
+      https_proxy: ${CONTAINER_HTTPS_PROXY:-}
+      NO_PROXY: ${CONTAINER_NO_PROXY:-localhost,127.0.0.1,redis,postgres,api,worker}
+      no_proxy: ${CONTAINER_NO_PROXY:-localhost,127.0.0.1,redis,postgres,api,worker}
+      RUNTIME_DATABASE_URL: postgresql://${POSTGRES_STATE_USER:-data_agent}:${POSTGRES_STATE_PASSWORD:-data_agent_dev}@postgres:5432/${POSTGRES_STATE_DB:-data_agent}
       MEMORY_DB_PATH: /var/lib/data-agent/memory.db
       OBSERVABILITY_DB_PATH: /var/lib/data-agent/observability.db
     ports:
@@ -17,9 +25,48 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "core_engine.task_worker"]
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TASK_EXECUTION_MODE: redis_streams
+      HTTP_PROXY: ${CONTAINER_HTTP_PROXY:-}
+      HTTPS_PROXY: ${CONTAINER_HTTPS_PROXY:-}
+      http_proxy: ${CONTAINER_HTTP_PROXY:-}
+      https_proxy: ${CONTAINER_HTTPS_PROXY:-}
+      NO_PROXY: ${CONTAINER_NO_PROXY:-localhost,127.0.0.1,redis,postgres,api,worker}
+      no_proxy: ${CONTAINER_NO_PROXY:-localhost,127.0.0.1,redis,postgres,api,worker}
+      DATA_AGENT_WORKER_PROCESS: "1"
+      AGENT_WORKER_CONCURRENCY: "1"
+      RUNTIME_DATABASE_URL: postgresql://${POSTGRES_STATE_USER:-data_agent}:${POSTGRES_STATE_PASSWORD:-data_agent_dev}@postgres:5432/${POSTGRES_STATE_DB:-data_agent}
+      MEMORY_DB_PATH: /var/lib/data-agent/memory.db
+      OBSERVABILITY_DB_PATH: /var/lib/data-agent/observability.db
+    volumes:
+      - agent_state:/var/lib/data-agent
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from core_engine.durable_tasks import durable_task_queue; raise SystemExit(0 if durable_task_queue.available() else 1)"]
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -37,6 +84,24 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_STATE_DB:-data_agent}
+      POSTGRES_USER: ${POSTGRES_STATE_USER:-data_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_STATE_PASSWORD:-data_agent_dev}
+    volumes:
+      - postgres_state:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_STATE_PORT:-5432}:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   agent_state:
   redis_data:
+  postgres_state:

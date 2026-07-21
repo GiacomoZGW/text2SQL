@@ -54,6 +54,33 @@ class DatabaseConnectorTests(unittest.TestCase):
         with self.assertRaises(ConnectorError):
             self.connector.explain("SELECT 1; SELECT 2")
 
+    def test_mysql_postgres_and_clickhouse_read_only_sessions_apply_engine_guards(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.statements = []
+
+            def execute(self, statement, parameters=None):
+                self.statements.append((str(statement), parameters or {}))
+
+        for engine, expected in (
+            ("mysql", "SET SESSION TRANSACTION READ ONLY"),
+            ("postgres", "SET TRANSACTION READ ONLY"),
+            ("clickhouse", "SET readonly = 1"),
+        ):
+            connector = SqlAlchemyConnector(
+                {
+                    "id": f"mock-{engine}",
+                    "engine": engine,
+                    "connection_secret_ref": "UNUSED_TEST_URI",
+                    "connector": {"query_timeout_seconds": 7, "tls": {"enabled": False}},
+                }
+            )
+            connection = RecordingConnection()
+            connector._configure_read_only_session(connection)
+            connector.dispose()
+
+            self.assertTrue(any(expected in statement for statement, _ in connection.statements), engine)
+
 
 if __name__ == "__main__":
     unittest.main()

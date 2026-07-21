@@ -35,6 +35,21 @@ class SchemaIndexerTests(unittest.TestCase):
         self.assertEqual(result["source"], "lexical_memory")
         self.assertEqual(result["tables"][0], "users")
 
+    @patch("vector_store.schema_indexer.DashScopeSDKEmbeddings")
+    def test_metadata_table_filter_is_applied_before_ranking(self, embeddings_class):
+        embeddings_class.return_value.embed_documents.return_value = [[1.0, 0.0], [0.0, 1.0]]
+        embeddings_class.return_value.embed_query.return_value = [0.0, 1.0]
+
+        result = schema_indexer.retrieve_relevant_schema(
+            "city",
+            "sqlite_filtered",
+            self.schema,
+            data_source_id="sqlite_local",
+            allowed_tables={"orders"},
+        )
+
+        self.assertEqual(result["tables"], ["orders"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,67 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertTrue(store.get_preferences("user-1")["memory_enabled"])
             self.assertEqual(store.get_conversation_context("conversation-1"), [])
 
+    def test_hot_context_uses_checkpoint_and_is_not_limited_to_four_turns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db", retention_days=30)
+            for index in range(7):
+                store.record_turn(
+                    "conversation-1",
+                    "user-1",
+                    "sqlite_local",
+                    f"question {index}",
+                    "text_to_sql",
+                    {"metric": "sales"} if index == 0 else {"dimension": f"city_{index}"},
+                    f"answer {index}",
+                    generated_sql="SELECT city, SUM(total) FROM orders GROUP BY city",
+                )
+
+            hot_context = store.get_hot_context("conversation-1", "user-1")
+
+            self.assertEqual(hot_context["metadata"]["available_turns"], 7)
+            self.assertEqual(hot_context["metadata"]["selected_turns"], 7)
+            self.assertTrue(hot_context["checkpoint"])
+            self.assertEqual(
+                hot_context["checkpoint"]["confirmed_entities"]["metric"],
+                "sales",
+            )
+            self.assertEqual(
+                hot_context["checkpoint"]["confirmed_entities"]["dimension"],
+                "city_6",
+            )
+            self.assertIn("GROUP BY city", hot_context["checkpoint"]["last_successful_sql"])
+
+    def test_failed_turn_updates_checkpoint_error_without_erasing_last_sql(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db", retention_days=30)
+            store.record_turn(
+                "conversation-1",
+                "user-1",
+                "sqlite_local",
+                "successful request",
+                "text_to_sql",
+                {"metric": "sales"},
+                "success",
+                generated_sql="SELECT SUM(total) FROM orders",
+            )
+            store.record_turn(
+                "conversation-1",
+                "user-1",
+                "sqlite_local",
+                "failed request",
+                "text_to_sql",
+                {"time_range": "last month"},
+                "failed",
+                execution_failed=True,
+                error_detail="ERROR: unknown column",
+            )
+
+            checkpoint = store.get_hot_context("conversation-1", "user-1")["checkpoint"]
+
+            self.assertIn("SUM(total)", checkpoint["last_successful_sql"])
+            self.assertEqual(checkpoint["last_error"], "ERROR: unknown column")
+            self.assertEqual(checkpoint["confirmed_entities"]["time_range"], "last month")
+
 
 if __name__ == "__main__":
     unittest.main()

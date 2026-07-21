@@ -78,6 +78,7 @@ class ObservabilityStoreTests(unittest.TestCase):
             self.assertEqual(request["request"]["clarification_resolved"], 1)
             self.assertEqual(summary["intent"]["classification"]["classified_count"], 2)
             self.assertEqual(summary["intent"]["classification"]["clarification_resolved_count"], 1)
+            self.assertEqual(summary["intent"]["classification"]["clarification_followup_success_count"], 1)
             self.assertEqual(summary["intent"]["llm"]["total_tokens"], 12)
             self.assertEqual(summary["intent"]["routes"][0]["route"], "clarification")
 
@@ -125,6 +126,21 @@ class ObservabilityStoreTests(unittest.TestCase):
             self.assertEqual(summary["requests"]["technical_success_rate"], 100.0)
             self.assertEqual(summary["requests"]["result_correct_rate"], 100.0)
             self.assertEqual(summary["requests"]["satisfaction_rate"], 100.0)
+
+    def test_queue_rejected_and_paused_requests_do_not_reduce_query_success_rate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ObservabilityStore(Path(temp_dir) / "observability.db")
+            store.start_request("success", "user-1", "hello", "sqlite")
+            store.complete_request("success", "success", 10, 0, technical_success=True)
+            store.start_request("paused", "user-1", "hello", "sqlite")
+            store.complete_request("paused", "paused", 1, 0, technical_success=False)
+            store.start_request("rejected", "user-1", "hello", "sqlite")
+            store.complete_request("rejected", "queue_rejected", 1, 0, technical_success=False)
+
+            summary = store.summary()
+
+            self.assertEqual(summary["requests"]["technical_evaluated_count"], 1)
+            self.assertEqual(summary["requests"]["technical_success_rate"], 100.0)
 
 
 if __name__ == "__main__":

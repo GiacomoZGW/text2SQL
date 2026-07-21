@@ -15,6 +15,25 @@ function apiHeaders(extra = {}) {
   return apiKey ? { ...extra, 'X-API-Key': apiKey } : extra;
 }
 
+function apiErrorFrom(response, payload) {
+  const apiError = payload?.error || {};
+  const error = new Error(apiError.message || `HTTP error! status: ${response.status}`);
+  error.status = response.status;
+  error.code = apiError.code || `HTTP_${response.status}`;
+  error.requestId = apiError.request_id || response.headers.get('X-Request-ID') || '';
+  error.idempotencyKey = apiError.idempotency_key || response.headers.get('Idempotency-Key') || '';
+  error.retryable = Boolean(apiError.retryable);
+  error.retryAfter = Number(response.headers.get('Retry-After') || 0);
+  return error;
+}
+
+function ensureApiSuccess(response, payload) {
+  if (!response.ok || Number(payload?.code || 200) >= 400) {
+    throw apiErrorFrom(response, payload);
+  }
+  return payload;
+}
+
 function readDemoModeInitial() {
   try {
     const v = sessionStorage.getItem(DEMO_STORAGE_KEY);
@@ -264,6 +283,23 @@ const Chat = () => {
     if (activeView === 'monitor') loadMonitorSummary();
   }, [activeView]);
 
+  const waitForDurableResult = async (requestId, signal) => {
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) throw new DOMException('Request polling aborted', 'AbortError');
+      const response = await fetch(apiUrl(`/api/v1/requests/${requestId}/result`), {
+        headers: apiHeaders(),
+        signal
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.status !== 202 && payload.code !== 202) {
+        return ensureApiSuccess(response, payload);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    throw new Error('等待 Worker 执行结果超时，请稍后重试。');
+  };
+
   const handleSend = async (overrideText = null) => {
     const userText = overrideText || inputValue.trim();
     if (!userText || isProcessing) return;
@@ -338,7 +374,7 @@ const Chat = () => {
       } else {
         const response = await fetch(queryUrl(), {
           method: 'POST',
-          headers: apiHeaders({ 'Content-Type': 'application/json' }),
+          headers: apiHeaders({ 'Content-Type': 'application/json', 'Idempotency-Key': requestId }),
           body: JSON.stringify({
             query: userText,
             data_source_id: dataSourceId || undefined,
@@ -349,11 +385,14 @@ const Chat = () => {
           signal: abortControllerRef.current.signal
         });
 
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+        resData = await response.json().catch(() => ({}));
+        if (response.status !== 202 && resData.code !== 202) {
+          resData = ensureApiSuccess(response, resData);
         }
-
-        resData = await response.json();
+        if (response.status === 202 || resData.code === 202) {
+          const durableRequestId = resData.data?.request_id || requestId;
+          resData = await waitForDurableResult(durableRequestId, abortControllerRef.current.signal);
+        }
       }
 
       updateStep('sql', 'completed');
@@ -393,7 +432,7 @@ const Chat = () => {
           status: paused ? 'paused' : 'error',
           content: paused
             ? '当前请求已暂停。'
-            : `执行失败。\n错误详情: ${error.message}\n💡 可开启侧栏「离线演示模式」体验界面；如需体验完整 LLM 生成与实时查询，请克隆仓库并运行 python api/main.py 启动后端。`,
+            : `Request failed: ${error.message}${error.code ? `\nError code: ${error.code}` : ''}${error.requestId ? `\nRequest ID: ${error.requestId}` : ''}${error.retryable ? '\nThis request can be retried.' : ''}`,
           steps: []
         } : msg
       ));
@@ -541,6 +580,7 @@ const Chat = () => {
             <button
               type="button"
               role="tab"
+              data-testid="workspace-tab"
               aria-selected={activeView === 'workspace'}
               onClick={() => setActiveView('workspace')}
               className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md ${activeView === 'workspace' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
@@ -551,6 +591,7 @@ const Chat = () => {
             <button
               type="button"
               role="tab"
+              data-testid="token-monitor-tab"
               aria-selected={activeView === 'monitor'}
               onClick={() => setActiveView('monitor')}
               className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md ${activeView === 'monitor' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}

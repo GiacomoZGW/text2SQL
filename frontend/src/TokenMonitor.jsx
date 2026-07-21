@@ -73,7 +73,7 @@ export default function TokenMonitor({ summary, loading, error, onRefresh }) {
   const agentEffectiveness = summary?.agent_effectiveness || [];
 
   return (
-    <div className="flex-1 overflow-y-auto bg-slate-50 p-4 sm:p-8">
+    <div data-testid="token-monitor-view" className="flex-1 overflow-y-auto bg-slate-50 p-4 sm:p-8">
       <div className="max-w-6xl mx-auto space-y-8">
         <div className="flex items-center justify-between border-b border-slate-200 pb-4">
           <div>

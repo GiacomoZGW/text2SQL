@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from core_engine.runtime_storage import RuntimeStorage
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "observability.db"
 
@@ -19,18 +21,22 @@ def _utc_now() -> str:
 class ObservabilityStore:
     def __init__(self, db_path: Path | str | None = None):
         self.db_path = Path(db_path or os.getenv("OBSERVABILITY_DB_PATH", DEFAULT_DB_PATH))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        database_url = (
+            None
+            if db_path is not None
+            else os.getenv("OBSERVABILITY_DATABASE_URL") or os.getenv("RUNTIME_DATABASE_URL")
+        )
+        self._storage = RuntimeStorage(self.db_path, database_url)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
+    def _connect(self):
+        return self._storage.connect()
 
     def _initialize(self) -> None:
         connection = self._connect()
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
+            if not self._storage.is_postgres:
+                connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS requests (
@@ -138,7 +144,8 @@ class ObservabilityStore:
                 CREATE INDEX IF NOT EXISTS idx_evaluation_case_results_run_id ON evaluation_case_results(run_id);
                 """
             )
-            self._ensure_request_columns(connection)
+            if not self._storage.is_postgres:
+                self._ensure_request_columns(connection)
             connection.execute(
                 """
                 UPDATE requests
@@ -195,16 +202,19 @@ class ObservabilityStore:
         tenant_id: str | None = None,
         role: str | None = None,
         is_evaluation: bool = False,
+        status: str = "running",
     ) -> None:
+        if status not in {"queued", "running"}:
+            raise ValueError("Request start status must be queued or running")
         query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
         connection = self._connect()
         try:
             connection.execute(
                 """
-                INSERT INTO requests (
+                INSERT OR IGNORE INTO requests (
                     request_id, user_id, tenant_id, role, query_hash, query_chars, target_db, data_source_id,
                     conversation_id, clarification_parent_request_id, status, is_evaluation, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -217,10 +227,19 @@ class ObservabilityStore:
                     data_source_id,
                     conversation_id,
                     clarification_parent_request_id,
+                    status,
                     int(is_evaluation),
                     _utc_now(),
                 ),
             )
+            if status == "running":
+                connection.execute(
+                    """
+                    UPDATE requests SET status = 'running'
+                    WHERE request_id = ? AND status = 'queued'
+                    """,
+                    (request_id,),
+                )
             connection.commit()
         finally:
             connection.close()
@@ -605,6 +624,7 @@ class ObservabilityStore:
                            SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_count,
                            SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted_count,
                            SUM(CASE WHEN status IN ('success', 'failed', 'paused', 'timed_out', 'queue_rejected') THEN 1 ELSE 0 END) AS terminal_count,
+                           SUM(CASE WHEN status IN ('success', 'failed', 'timed_out') THEN 1 ELSE 0 END) AS technical_evaluated_count,
                            SUM(CASE WHEN technical_success = 1 THEN 1 ELSE 0 END) AS technical_success_count,
                            SUM(CASE WHEN sql_executable IS NOT NULL THEN 1 ELSE 0 END) AS sql_attempt_count,
                            SUM(CASE WHEN sql_executable = 1 THEN 1 ELSE 0 END) AS sql_executable_count,
@@ -665,13 +685,16 @@ class ObservabilityStore:
                 """,
                 (since,),
             )
-            clarification_followup_success_count = connection.execute(
+            clarification_followup_row = connection.execute(
                 """
-                SELECT COUNT(*) FROM requests
+                SELECT COUNT(*) AS success_count FROM requests
                 WHERE started_at >= ? AND is_evaluation = 0 AND clarification_parent_request_id IS NOT NULL AND status = 'success'
                 """,
                 (since,),
-            ).fetchone()[0]
+            ).fetchone()
+            clarification_followup_success_count = (
+                clarification_followup_row["success_count"] if clarification_followup_row else 0
+            )
             by_agent = self._rows(
                 connection,
                 """
@@ -706,6 +729,7 @@ class ObservabilityStore:
                        SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_count,
                        SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted_count,
                        SUM(CASE WHEN status IN ('success', 'failed', 'paused', 'timed_out', 'queue_rejected') THEN 1 ELSE 0 END) AS terminal_count,
+                       SUM(CASE WHEN status IN ('success', 'failed', 'timed_out') THEN 1 ELSE 0 END) AS technical_evaluated_count,
                        SUM(CASE WHEN technical_success = 1 THEN 1 ELSE 0 END) AS technical_success_count
                 FROM requests WHERE started_at >= ? AND is_evaluation = 0 GROUP BY bucket ORDER BY bucket
                 """,
@@ -728,7 +752,7 @@ class ObservabilityStore:
             for request_bucket in request_buckets:
                 token_bucket = token_by_bucket.get(request_bucket["bucket"], {})
                 request_count = request_bucket["request_count"] or 0
-                terminal_count = request_bucket["terminal_count"] or 0
+                technical_evaluated_count = request_bucket["technical_evaluated_count"] or 0
                 technical_success_count = request_bucket["technical_success_count"] or 0
                 timeline.append(
                     {
@@ -736,8 +760,8 @@ class ObservabilityStore:
                         "request_count": request_count,
                         "running_count": request_bucket["running_count"] or 0,
                         "aborted_count": request_bucket["aborted_count"] or 0,
-                        "technical_success_rate": round(technical_success_count / terminal_count * 100, 2)
-                        if terminal_count
+                        "technical_success_rate": round(technical_success_count / technical_evaluated_count * 100, 2)
+                        if technical_evaluated_count
                         else 0,
                         "total_tokens": token_bucket.get("total_tokens") or 0,
                         "average_llm_latency_ms": round(token_bucket.get("average_llm_latency_ms") or 0, 2),
@@ -746,13 +770,13 @@ class ObservabilityStore:
             for row in agent_effectiveness:
                 terminal_event_count = (row["completed_count"] or 0) + (row["failed_count"] or 0)
                 row["completion_rate"] = round((row["completed_count"] or 0) / terminal_event_count * 100, 2) if terminal_event_count else 0
-            terminal_count = request_totals.get("terminal_count") or 0
+            technical_evaluated_count = request_totals.get("technical_evaluated_count") or 0
             sql_attempt_count = request_totals.get("sql_attempt_count") or 0
             result_evaluated_count = request_totals.get("result_evaluated_count") or 0
             satisfaction_response_count = request_totals.get("satisfaction_response_count") or 0
             request_totals["technical_success_rate"] = round(
-                (request_totals.get("technical_success_count") or 0) / terminal_count * 100, 2
-            ) if terminal_count else 0
+                (request_totals.get("technical_success_count") or 0) / technical_evaluated_count * 100, 2
+            ) if technical_evaluated_count else 0
             request_totals["sql_executable_rate"] = round(
                 (request_totals.get("sql_executable_count") or 0) / sql_attempt_count * 100, 2
             ) if sql_attempt_count else 0

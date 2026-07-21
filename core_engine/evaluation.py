@@ -67,3 +67,34 @@ def score_final_state(case: dict[str, Any], final_state: dict[str, Any]) -> dict
             "expected_result_contains": case.get("expected_result_contains", []),
         },
     }
+
+
+def summarize_scores(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate evaluation dimensions without conflating agent events with quality."""
+    total = len(results)
+    passed = sum(1 for result in results if result.get("status") == "passed")
+    intent_evaluated = [result for result in results if result.get("intent_correct") is not None]
+    sql_evaluated = [result for result in results if result.get("sql_executable") is not None]
+    result_evaluated = [result for result in results if result.get("result_correct") is not None]
+    by_category: dict[str, dict[str, int]] = {}
+    for result in results:
+        category = str(result.get("category", "uncategorized"))
+        bucket = by_category.setdefault(category, {"total": 0, "passed": 0})
+        bucket["total"] += 1
+        if result.get("status") == "passed":
+            bucket["passed"] += 1
+    return {
+        "total_cases": total,
+        "passed_cases": passed,
+        "pass_rate": round(passed / total * 100, 2) if total else 0,
+        "intent_accuracy": round(sum(bool(result["intent_correct"]) for result in intent_evaluated) / len(intent_evaluated) * 100, 2)
+        if intent_evaluated
+        else None,
+        "sql_executable_rate": round(sum(bool(result["sql_executable"]) for result in sql_evaluated) / len(sql_evaluated) * 100, 2)
+        if sql_evaluated
+        else None,
+        "result_correct_rate": round(sum(bool(result["result_correct"]) for result in result_evaluated) / len(result_evaluated) * 100, 2)
+        if result_evaluated
+        else None,
+        "by_category": by_category,
+    }

@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from core_engine.evaluation import load_golden_cases, score_final_state
+from core_engine.evaluation import load_golden_cases, score_final_state, summarize_scores
 
 
 class EvaluationTests(unittest.TestCase):
@@ -32,6 +32,18 @@ class EvaluationTests(unittest.TestCase):
         self.assertTrue(score["intent_correct"])
         self.assertTrue(score["sql_executable"])
         self.assertTrue(score["result_correct"])
+
+    def test_summary_keeps_intent_sql_and_result_dimensions_separate(self):
+        summary = summarize_scores(
+            [
+                {"category": "intent", "status": "passed", "intent_correct": True, "sql_executable": None, "result_correct": None},
+                {"category": "sql", "status": "failed", "intent_correct": True, "sql_executable": False, "result_correct": None},
+            ]
+        )
+
+        self.assertEqual(summary["intent_accuracy"], 100.0)
+        self.assertEqual(summary["sql_executable_rate"], 0.0)
+        self.assertEqual(summary["by_category"]["sql"]["passed"], 0)
 
 
 if __name__ == "__main__":

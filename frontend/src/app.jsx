@@ -461,6 +461,7 @@ const App = () => {
           <div className="flex items-center gap-3 sm:gap-4">
             <button
               type="button"
+              data-testid="open-text2sql"
               onClick={() => setPage('text2sql')}
               className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 shadow-sm transition hover:border-zinc-400 hover:bg-zinc-50"
             >

@@ -2,6 +2,24 @@ auth:
   # Local development keeps the demo usable. Production must set DATA_AGENT_AUTH_MODE=api_key.
   default_mode: development
   development_user_id: test_user_001
+  oidc:
+    # Environment variables override these values. Configure issuer/audience/JWKS
+    # only in a deployment secret store, never in a browser bundle.
+    issuer: ""
+    audience: ""
+    jwks_url: ""
+    user_claim: sub
+    tenant_claim: tenant_id
+    role_claim: roles
+    role_mapping: {}
+  rate_limit:
+    # Development stays unlimited by default. Enable this in shared deployments.
+    enabled: false
+    window_seconds: 60
+    requests: 60
+    role_requests:
+      admin: 180
+      analyst: 60
 
 roles:
   admin:

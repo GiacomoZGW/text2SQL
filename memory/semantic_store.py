@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from core_engine.runtime_storage import RuntimeStorage
+from core_engine.runtime_config import get_runtime_config
 from vector_store.schema_indexer import DashScopeSDKEmbeddings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,13 +37,12 @@ class SemanticMemoryStore:
         self.retention_days = max(1, int(retention_days or os.getenv("SEMANTIC_MEMORY_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)))
         self._embeddings: DashScopeSDKEmbeddings | None = None
         self._embedding_unavailable = False
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        database_url = None if db_path is not None else os.getenv("MEMORY_DATABASE_URL") or os.getenv("RUNTIME_DATABASE_URL")
+        self._storage = RuntimeStorage(self.db_path, database_url)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
+    def _connect(self):
+        return self._storage.connect()
 
     def _initialize(self) -> None:
         connection = self._connect()
@@ -154,7 +155,7 @@ class SemanticMemoryStore:
                     json.dumps(metadata, ensure_ascii=False),
                     content_hash,
                     json.dumps(embedding) if embedding else None,
-                    "text-embedding-v4" if embedding else None,
+                    get_runtime_config().embedding_model if embedding else None,
                     int(confirmed),
                     now,
                     now,

@@ -11,26 +11,28 @@ import re
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
 
+from core_engine.runtime_config import get_runtime_config
 from core_engine.shared_state import shared_state
 
 VECTOR_STORE_DIR = Path(__file__).resolve().parent / "chroma_db"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-EMBEDDING_MODEL = "text-embedding-v4"
 DEFAULT_BACKEND = "dashscope_memory"
 SCHEMA_CACHE_TTL_SECONDS = max(60, int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "3600")))
-
-load_dotenv(PROJECT_ROOT / ".env")
 
 
 class DashScopeSDKEmbeddings:
     """Compatibility adapter used by semantic memory and schema retrieval."""
 
-    def __init__(self, model: str = EMBEDDING_MODEL):
-        self._embeddings = DashScopeEmbeddings(model=model)
+    def __init__(self, model: str | None = None):
+        model_config = get_runtime_config()
+        self._embeddings = DashScopeEmbeddings(
+            model=model or model_config.embedding_model,
+            dashscope_api_key=model_config.dashscope_api_key,
+            max_retries=model_config.embedding_max_retries,
+        )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embeddings.embed_documents(texts)
@@ -47,7 +49,14 @@ def _catalog_hash(schema_context: str) -> str:
     return hashlib.sha256(schema_context.encode("utf-8")).hexdigest()
 
 
-def _schema_documents(schema_context: str, db_type: str) -> list[Document]:
+def _line_value(content: str, prefix: str) -> str:
+    for line in content.splitlines():
+        if line.startswith(prefix):
+            return line.removeprefix(prefix).strip()
+    return ""
+
+
+def _schema_documents(schema_context: str, db_type: str, data_source_id: str = "") -> list[Document]:
     documents: list[Document] = []
     catalog_hash = _catalog_hash(schema_context)
     for section in schema_context.split("\n\n"):
@@ -55,12 +64,17 @@ def _schema_documents(schema_context: str, db_type: str) -> list[Document]:
         if not content or not content.startswith("Table: "):
             continue
         table_name = content.splitlines()[0].removeprefix("Table: ").strip()
+        aliases = _line_value(content, "Aliases: ")
+        metrics = _line_value(content, "Metrics: ")
         documents.append(
             Document(
                 page_content=content,
                 metadata={
                     "table": table_name,
                     "db_type": db_type,
+                    "data_source_id": data_source_id,
+                    "aliases": aliases,
+                    "metrics": metrics,
                     "catalog_hash": catalog_hash,
                 },
             )
@@ -81,6 +95,38 @@ def _lexical_score(query: str, content: str) -> float:
     if not query_terms:
         return 0.0
     return len(query_terms & content_terms) / len(query_terms)
+
+
+def _metadata_score(query: str, document: Document) -> float:
+    metadata_text = " ".join(
+        str(document.metadata.get(field, "")) for field in ("table", "aliases", "metrics", "data_source_id")
+    )
+    return _lexical_score(query, metadata_text)
+
+
+def _hybrid_rank(
+    query: str,
+    documents: list[Document],
+    vectors: list[list[float]] | None = None,
+) -> list[tuple[Document, float]]:
+    query_vector: list[float] | None = None
+    if vectors:
+        try:
+            query_vector = DashScopeSDKEmbeddings().embed_query(query)
+        except Exception:
+            query_vector = None
+
+    ranked: list[tuple[Document, float]] = []
+    for index, document in enumerate(documents):
+        lexical = _lexical_score(query, document.page_content)
+        metadata = _metadata_score(query, document)
+        if query_vector is not None and vectors is not None:
+            vector = max(0.0, (_cosine_similarity(query_vector, vectors[index]) + 1.0) / 2.0)
+            score = vector * 0.55 + lexical * 0.30 + metadata * 0.15
+        else:
+            score = lexical * 0.70 + metadata * 0.30
+        ranked.append((document, score))
+    return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
 def _memory_matches(query: str, documents: list[Document], db_type: str, limit: int) -> tuple[list[Document], str, str]:
@@ -109,19 +155,11 @@ def _memory_matches(query: str, documents: list[Document], db_type: str, limit: 
         _MEMORY_CATALOGS[db_type] = {"catalog_hash": catalog_hash, "vectors": vectors}
 
     if vectors:
-        try:
-            query_vector = DashScopeSDKEmbeddings().embed_query(query)
-            ranked = sorted(
-                zip(documents, vectors),
-                key=lambda item: _cosine_similarity(query_vector, item[1]),
-                reverse=True,
-            )
-            return [document for document, _ in ranked[:limit]], "dashscope_memory", detail_suffix
-        except Exception as exc:
-            detail_suffix += f"; query embedding fallback={exc}"
+        ranked = _hybrid_rank(query, documents, vectors)
+        return [document for document, _ in ranked[:limit]], "dashscope_memory", detail_suffix + "; ranking=vector+keyword+metadata"
 
-    ranked_documents = sorted(documents, key=lambda document: _lexical_score(query, document.page_content), reverse=True)
-    return ranked_documents[:limit], "lexical_memory", detail_suffix
+    ranked_documents = _hybrid_rank(query, documents)
+    return [document for document, _ in ranked_documents[:limit]], "lexical_memory", detail_suffix + "; ranking=keyword+metadata"
 
 
 def _collection_name(db_type: str) -> str:
@@ -136,7 +174,7 @@ def _get_chroma_vectorstore(db_type: str):
     return Chroma(
         collection_name=_collection_name(db_type),
         persist_directory=str(VECTOR_STORE_DIR),
-        embedding_function=DashScopeEmbeddings(model=EMBEDDING_MODEL),
+        embedding_function=DashScopeSDKEmbeddings(),
     )
 
 
@@ -149,7 +187,8 @@ def _chroma_matches(query: str, documents: list[Document], db_type: str, limit: 
         if existing.get("ids"):
             vectorstore.delete(ids=existing["ids"])
         vectorstore.add_documents(documents)
-    return [document for document, _ in vectorstore.similarity_search_with_score(query, k=min(limit, len(documents)))]
+    candidate_limit = min(max(limit * 3, limit), len(documents))
+    return [document for document, _ in vectorstore.similarity_search_with_score(query, k=candidate_limit)]
 
 
 def retrieve_relevant_schema(
@@ -157,9 +196,19 @@ def retrieve_relevant_schema(
     db_type: str,
     schema_context: str,
     limit: int = 4,
+    data_source_id: str = "",
+    allowed_tables: set[str] | None = None,
 ) -> dict[str, Any]:
     """Retrieve live schema safely, falling back to lexical ranking when embedding fails."""
-    documents = _schema_documents(schema_context, db_type)
+    documents = _schema_documents(schema_context, db_type, data_source_id)
+    if allowed_tables is not None:
+        normalized_allowed = {table.lower() for table in allowed_tables}
+        documents = [
+            document
+            for document in documents
+            if document.metadata["table"].lower() in normalized_allowed
+            or document.metadata["table"].lower().split(".")[-1] in normalized_allowed
+        ]
     if not documents:
         return {"context": schema_context, "source": "fallback", "detail": "schema catalog is empty", "tables": []}
 
@@ -168,8 +217,9 @@ def retrieve_relevant_schema(
     if backend == "chroma":
         try:
             matches = _chroma_matches(query, documents, db_type, bounded_limit)
+            matches = [document for document, _ in _hybrid_rank(query, matches)[:bounded_limit]]
             source = "chroma"
-            detail = f"retrieved={len(matches)} of {len(documents)} tables"
+            detail = f"retrieved={len(matches)} of {len(documents)} tables; ranking=vector+keyword+metadata"
         except Exception as exc:
             matches, source, suffix = _memory_matches(query, documents, db_type, bounded_limit)
             detail = f"Chroma unavailable: {exc}; retrieved={len(matches)} of {len(documents)} tables{suffix}"

@@ -1,17 +1,20 @@
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import sys
 import os
 import time
 from pathlib import Path
 from uuid import uuid4
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # 将项目根目录加入模块检索路径，以便顺利导入 agents 模块
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,23 +25,37 @@ from agents.workflow import app as agent_app
 from core_engine.data_source_registry import DataSourceError, create_data_source_registry
 from core_engine.database_connectors import ConnectorError, direct_connector_registry
 from core_engine.access_control import AccessDeniedError, Principal, access_control
-from core_engine.evaluation import EvaluationCaseError, load_golden_cases, score_final_state
+from core_engine.evaluation import EvaluationCaseError, load_golden_cases, score_final_state, summarize_scores
+from core_engine.durable_tasks import DurableTaskUnavailable, TERMINAL_STATUSES, durable_task_queue
 from core_engine.request_control import RequestPaused, request_control
 from core_engine.request_runtime import RequestQueueFull, RequestTimedOut, request_runtime
+from core_engine.runtime_config import get_runtime_config
+from core_engine.telemetry import telemetry
 from langchain_core.messages import HumanMessage
 from memory import memory_store, semantic_memory_store
 from observability import observability_store
 
 data_source_registry = create_data_source_registry(Path(BASE_DIR))
+model_runtime_config = get_runtime_config()
 LEGACY_DATA_SOURCE_IDS = {"sqlite": "sqlite_local", "federated": "federated_demo"}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    reconciled = observability_store.reconcile_stale_running_requests(
-        int(os.getenv("REQUEST_STALE_AFTER_SECONDS", "300"))
+    telemetry.configure()
+    model_status = model_runtime_config.public_status()
+    print(
+        "[Startup] "
+        f"llm={model_status['status']} model={model_status['model']} "
+        f"credential_source={model_status['credential_source']} "
+        f"state_backend={'postgresql' if os.getenv('RUNTIME_DATABASE_URL', '').strip() else 'sqlite'} "
+        f"task_mode={durable_task_queue.mode}"
     )
-    if reconciled:
-        print(f"[Observability] marked {reconciled} stale running requests as aborted")
+    if durable_task_queue.mode != "redis_streams":
+        reconciled = observability_store.reconcile_stale_running_requests(
+            int(os.getenv("REQUEST_STALE_AFTER_SECONDS", "300"))
+        )
+        if reconciled:
+            print(f"[Observability] marked {reconciled} stale running requests as aborted")
     await request_runtime.start()
     yield
     await request_runtime.stop()
@@ -62,6 +79,116 @@ app.add_middleware(
 )
 
 
+HTTP_ERROR_CODES = {
+    400: "BAD_REQUEST",
+    401: "UNAUTHENTICATED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "CONFLICT",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+    504: "GATEWAY_TIMEOUT",
+}
+
+
+def _safe_request_identifier(value: str | None, fallback: str | None = None) -> str:
+    candidate = (value or fallback or "").strip()
+    return candidate[:128] if candidate and candidate.replace("-", "").replace("_", "").isalnum() else uuid4().hex
+
+
+def _api_error(
+    request: Request | None,
+    status_code: int,
+    error_code: str,
+    message: str,
+    *,
+    request_id: str | None = None,
+    retryable: bool = False,
+    details: dict[str, object] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse | dict[str, object]:
+    correlation_id = request_id or getattr(getattr(request, "state", None), "request_id", None) or uuid4().hex
+    idempotency_key = getattr(getattr(request, "state", None), "idempotency_key", None)
+    payload: dict[str, object] = {
+        "code": status_code,
+        "error": {
+            "code": error_code,
+            "type": HTTP_ERROR_CODES.get(status_code, "API_ERROR"),
+            "message": message,
+            "request_id": correlation_id,
+            "idempotency_key": idempotency_key,
+            "retryable": retryable,
+            "details": details or {},
+        },
+    }
+    if request is None:
+        return payload
+    return JSONResponse(status_code=status_code, content=payload, headers=headers)
+
+
+@app.middleware("http")
+async def attach_request_metadata(request: Request, call_next):
+    request.state.request_id = _safe_request_identifier(request.headers.get("X-Request-ID"))
+    request.state.idempotency_key = _safe_request_identifier(request.headers.get("Idempotency-Key"), "") if request.headers.get("Idempotency-Key") else None
+    with telemetry.span(
+        "http.request",
+        {
+            "http.request.method": request.method,
+            "url.path": request.url.path,
+            "data_agent.request_id": request.state.request_id,
+        },
+    ) as span:
+        response = await call_next(request)
+        if span is not None:
+            span.set_attribute("http.response.status_code", response.status_code)
+    response.headers["X-Request-ID"] = request.state.request_id
+    trace_id = telemetry.current_trace_id()
+    if trace_id:
+        response.headers["X-Trace-ID"] = trace_id
+    if request.state.idempotency_key:
+        response.headers["Idempotency-Key"] = request.state.idempotency_key
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    return _api_error(
+        request,
+        422,
+        "VALIDATION_ERROR",
+        "Request validation failed.",
+        details={"fields": exc.errors()},
+    )
+
+
+@app.exception_handler(AccessDeniedError)
+async def access_denied_handler(request: Request, exc: AccessDeniedError):
+    return _api_error(request, 403, "FORBIDDEN", "You are not authorized for this resource.")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    message = exc.detail if isinstance(exc.detail, str) else "Request could not be completed."
+    status_code = int(exc.status_code)
+    return _api_error(
+        request,
+        status_code,
+        HTTP_ERROR_CODES.get(status_code, "HTTP_ERROR"),
+        message,
+        retryable=status_code in {429, 503, 504},
+        headers=dict(exc.headers or {}),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[API] unhandled error request_id={getattr(request.state, 'request_id', '')}: {exc}")
+    return _api_error(request, 500, "INTERNAL_ERROR", "An unexpected server error occurred.", retryable=True)
+
+
 @app.get("/health/live", include_in_schema=False)
 async def liveness_probe():
     """Report whether the API process can receive traffic."""
@@ -70,26 +197,76 @@ async def liveness_probe():
 
 @app.get("/health/ready", include_in_schema=False)
 async def readiness_probe():
-    """Report whether the local API runtime and source registry are ready."""
+    """Report model, queue, state-store and data-source readiness safely."""
+    components: dict[str, object] = {
+        "model": model_runtime_config.public_status(),
+        "request_runtime": {"status": "ready" if request_runtime._started else "not_ready"},
+        "task_queue": {
+            "status": "ready" if not durable_task_queue.api_enabled or durable_task_queue.available() else "not_ready",
+            "mode": durable_task_queue.mode,
+        },
+        "state_store": {
+            "status": "checking",
+            "backend": "postgresql" if os.getenv("RUNTIME_DATABASE_URL", "").strip() else "sqlite",
+        },
+    }
     try:
         enabled_sources = data_source_registry.list_enabled()
     except DataSourceError as exc:
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "reason": str(exc)},
+            content={"status": "not_ready", "reason": str(exc), "components": components},
+        )
+
+    components["data_sources"] = {"status": "ready", "enabled": len(enabled_sources)}
+    if not model_runtime_config.llm_configured:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "OPENAI_API_KEY or DASHSCOPE_API_KEY is not configured",
+                "components": components,
+            },
         )
 
     if not request_runtime._started:
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "reason": "request runtime is not started"},
+            content={"status": "not_ready", "reason": "request runtime is not started", "components": components},
         )
-    return {"status": "ready", "enabled_data_sources": len(enabled_sources)}
+    if durable_task_queue.api_enabled and not durable_task_queue.available():
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": "Redis Streams task queue is unavailable", "components": components},
+        )
+    try:
+        # Each call opens a fresh state-store connection, so this also catches a
+        # PostgreSQL outage after the API process has started.
+        memory_store.get_preferences("__runtime_healthcheck__")
+        observability_store.get_request("__runtime_healthcheck__")
+    except Exception as exc:
+        components["state_store"] = {
+            "status": "not_ready",
+            "backend": components["state_store"]["backend"],
+        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": f"runtime state storage is unavailable: {exc}",
+                "components": components,
+            },
+        )
+    components["state_store"] = {
+        "status": "ready",
+        "backend": components["state_store"]["backend"],
+    }
+    return {"status": "ready", "enabled_data_sources": len(enabled_sources), "components": components}
 
 
 # 定义前端传入的数据结构
 class QueryRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=8_000)
     data_source_id: str | None = None
     conversation_id: str | None = None
     clarification_parent_request_id: str | None = None
@@ -169,13 +346,27 @@ def _authorize_data_source(principal: Principal, data_source_id: str) -> None:
 def _authorize_request_owner(principal: Principal, request_id: str) -> None:
     request_data = observability_store.get_request(request_id)
     owner_id = (request_data or {}).get("request", {}).get("user_id")
+    if owner_id is None and durable_task_queue.api_enabled:
+        try:
+            owner_id = durable_task_queue.owner_id(request_id)
+        except DurableTaskUnavailable:
+            owner_id = None
     if owner_id is None:
         raise HTTPException(status_code=404, detail="Request not found")
     access_control.require_self_or_admin(principal, str(owner_id))
 
 
 @app.post("/api/v1/query")
-async def query_database(request: QueryRequest, principal: Principal = Depends(access_control.current_principal)):
+async def query_database(
+    request: QueryRequest,
+    principal: Principal = Depends(access_control.current_principal),
+    http_request: Request = None,
+):
+    if not model_runtime_config.llm_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM is not configured. Set OPENAI_API_KEY or DASHSCOPE_API_KEY and restart the service.",
+        )
     print(f"\n[API] received query: {request.query}")
     user_preferences = memory_store.get_preferences(principal.user_id)
     memory_enabled = bool(user_preferences.get("memory_enabled", True))
@@ -191,17 +382,86 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     _authorize_data_source(principal, data_source_id)
 
-    request_id = (request.client_request_id or uuid4().hex).strip()
+    header_idempotency_key = getattr(getattr(http_request, "state", None), "idempotency_key", None)
+    request_id = (request.client_request_id or header_idempotency_key or uuid4().hex).strip()
     if not request_id or len(request_id) > 128:
         raise HTTPException(status_code=422, detail="Invalid client_request_id")
+    if http_request is not None:
+        http_request.state.idempotency_key = request_id
     if request.clarification_parent_request_id:
         _authorize_request_owner(principal, request.clarification_parent_request_id)
+    execution_mode = str(data_source["execution_mode"])
+    if durable_task_queue.api_enabled:
+        try:
+            existing_task = durable_task_queue.get(request_id)
+        except DurableTaskUnavailable as exc:
+            raise HTTPException(status_code=503, detail="Durable task queue is unavailable") from exc
+        if existing_task is not None:
+            if existing_task.get("user_id") != principal.user_id:
+                access_control.require_self_or_admin(principal, str(existing_task.get("user_id", "")))
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "code": 202,
+                    "data": {
+                        "request_id": request_id,
+                        "status": existing_task["public"]["status"],
+                        "status_url": f"/api/v1/requests/{request_id}/status",
+                        "result_url": f"/api/v1/requests/{request_id}/result",
+                    },
+                },
+            )
+        request_control.clear(request_id)
+        observability_store.start_request(
+            request_id,
+            principal.user_id,
+            request.query,
+            execution_mode,
+            data_source_id=data_source_id,
+            conversation_id=request.conversation_id,
+            clarification_parent_request_id=request.clarification_parent_request_id,
+            tenant_id=principal.tenant_id,
+            role=principal.role,
+            status="queued",
+        )
+        try:
+            trace_context: dict[str, str] = {}
+            telemetry.inject(trace_context)
+            task = durable_task_queue.enqueue(
+                request_id,
+                principal.user_id,
+                {
+                    "request": request.model_dump(),
+                    "principal": principal.public(),
+                    "trace_context": trace_context,
+                },
+            )
+        except DurableTaskUnavailable as exc:
+            observability_store.complete_request(
+                request_id, "queue_unavailable", 0, 0, str(exc), technical_success=False
+            )
+            raise HTTPException(status_code=503, detail="Durable task queue is unavailable") from exc
+        _audit(principal, "query", "data_source", "queued", resource_id=data_source_id, request_id=request_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "code": 202,
+                "data": {
+                    "request_id": request_id,
+                    "status": task["public"]["status"],
+                    "status_url": f"/api/v1/requests/{request_id}/status",
+                    "result_url": f"/api/v1/requests/{request_id}/result",
+                },
+            },
+        )
     request_control.clear(request_id)
     started = time.perf_counter()
-    execution_mode = str(data_source["execution_mode"])
-    conversation_context = (
-        memory_store.get_conversation_context(request.conversation_id, user_id=principal.user_id) if memory_enabled else []
+    hot_context = (
+        memory_store.get_hot_context(request.conversation_id, user_id=principal.user_id)
+        if memory_enabled
+        else {"recent_turns": [], "checkpoint": {}, "metadata": {}}
     )
+    conversation_context = hot_context["recent_turns"]
     observability_store.start_request(
         request_id,
         principal.user_id,
@@ -224,6 +484,8 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
         "data_source_id": data_source_id,
         "target_db_type": execution_mode,
         "conversation_context": conversation_context,
+        "conversation_checkpoint": hot_context["checkpoint"],
+        "conversation_context_metadata": hot_context["metadata"],
         "user_preferences": user_preferences if memory_enabled else {},
         "memory_enabled": memory_enabled,
         "error_count": 0,
@@ -271,6 +533,13 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
                 intent=final_state.get("intent", ""),
                 entities=final_state.get("entities", {}),
                 answer=answer,
+                generated_sql=final_state.get("generated_sql", ""),
+                execution_failed=execution_failed,
+                error_detail=(
+                    final_state.get("validation_result", "")
+                    if final_state.get("validation_result", "").startswith("ERROR:")
+                    else final_state.get("execution_result", "")
+                ),
             )
         if request.data_source_id:
             user_preferences = memory_store.update_preferences(
@@ -321,6 +590,11 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
                     },
                     "memory": {
                         "context_turns": len(conversation_context),
+                        "available_turns": hot_context["metadata"].get("available_turns", 0),
+                        "hot_context_chars": hot_context["metadata"].get("used_chars", 0),
+                        "hot_context_budget_chars": hot_context["metadata"].get("char_budget", 0),
+                        "older_turns_omitted": hot_context["metadata"].get("older_turns_omitted", False),
+                        "checkpoint_available": bool(hot_context["checkpoint"]),
                         "enabled": memory_enabled,
                         "default_data_source_id": user_preferences.get("default_data_source_id"),
                         "semantic_memories_used": len(final_state.get("semantic_memories", [])),
@@ -359,13 +633,15 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
             technical_success=False,
         )
         _audit(principal, "query", "data_source", "timed_out", resource_id=data_source_id, request_id=request_id)
-        return {
-            "code": 504,
-            "data": {
-                "answer": "Request timed out. The workflow received a pause signal; narrow the query and retry.",
-                "metrics": {"request_id": request_id, "runtime_status": "timed_out"},
-            },
-        }
+        return _api_error(
+            http_request,
+            504,
+            "REQUEST_TIMED_OUT",
+            "The request exceeded the execution timeout. Narrow the query and retry.",
+            request_id=request_id,
+            retryable=True,
+            details={"runtime_status": "timed_out"},
+        )
     except RequestQueueFull:
         observability_store.complete_request(
             request_id=request_id,
@@ -376,13 +652,16 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
             technical_success=False,
         )
         _audit(principal, "query", "data_source", "queue_rejected", resource_id=data_source_id, request_id=request_id)
-        return {
-            "code": 429,
-            "data": {
-                "answer": "The query queue is busy. Please retry shortly.",
-                "metrics": {"request_id": request_id, "runtime_status": "queue_rejected"},
-            },
-        }
+        return _api_error(
+            http_request,
+            429,
+            "QUERY_QUEUE_FULL",
+            "The query queue is busy. Retry shortly.",
+            request_id=request_id,
+            retryable=True,
+            details={"runtime_status": "queue_rejected"},
+            headers={"Retry-After": "3"},
+        )
     except RequestPaused:
         observability_store.complete_request(
             request_id=request_id,
@@ -393,7 +672,15 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
             technical_success=False,
         )
         _audit(principal, "query", "data_source", "paused", resource_id=data_source_id, request_id=request_id)
-        return {"code": 499, "data": {"answer": "请求已暂停。", "metrics": {"request_id": request_id}}}
+        return _api_error(
+            http_request,
+            409,
+            "REQUEST_PAUSED",
+            "The request was paused.",
+            request_id=request_id,
+            retryable=True,
+            details={"runtime_status": "paused"},
+        )
     except Exception as e:
         observability_store.complete_request(
             request_id=request_id,
@@ -404,13 +691,14 @@ async def query_database(request: QueryRequest, principal: Principal = Depends(a
             technical_success=False,
         )
         _audit(principal, "query", "data_source", "failed", resource_id=data_source_id, request_id=request_id, details={"error": str(e)})
-        return {
-            "code": 500,
-            "data": {
-                "answer": f"API 内部执行发生错误: {str(e)}",
-                "metrics": {}
-            }
-        }
+        return _api_error(
+            http_request,
+            500,
+            "QUERY_EXECUTION_ERROR",
+            "The query could not be completed due to an internal error.",
+            request_id=request_id,
+            retryable=True,
+        )
     finally:
         if not retain_pause_marker:
             request_control.clear(request_id)
@@ -429,7 +717,11 @@ async def current_session(principal: Principal = Depends(access_control.current_
 
 
 @app.get("/api/v1/data-sources/{data_source_id}/health")
-async def check_data_source_health(data_source_id: str, principal: Principal = Depends(access_control.current_principal)):
+async def check_data_source_health(
+    data_source_id: str,
+    principal: Principal = Depends(access_control.current_principal),
+    http_request: Request = None,
+):
     """Probe one enabled direct connector without exposing its URI or credentials."""
     try:
         source = data_source_registry.resolve(data_source_id)
@@ -451,7 +743,16 @@ async def check_data_source_health(data_source_id: str, principal: Principal = D
         health = direct_connector_registry.connector_for(source).health_check()
     except ConnectorError as exc:
         health = {"healthy": False, "engine": source.get("engine"), "error": str(exc)}
-    return {"code": 200 if health.get("healthy") else 503, "data": {"data_source_id": data_source_id, **health}}
+    if not health.get("healthy"):
+        return _api_error(
+            http_request,
+            503,
+            "DATA_SOURCE_UNAVAILABLE",
+            "The data source health check failed.",
+            retryable=True,
+            details={"data_source_id": data_source_id, "engine": source.get("engine")},
+        )
+    return {"code": 200, "data": {"data_source_id": data_source_id, **health}}
 
 
 @app.get("/api/v1/memory/preferences/{user_id}")
@@ -493,6 +794,23 @@ async def delete_user_memory(user_id: str, principal: Principal = Depends(access
 @app.post("/api/v1/requests/{request_id}/pause")
 async def pause_request(request_id: str, principal: Principal = Depends(access_control.current_principal)):
     _authorize_request_owner(principal, request_id)
+    if durable_task_queue.api_enabled:
+        try:
+            task = durable_task_queue.request_pause(request_id)
+        except DurableTaskUnavailable as exc:
+            raise HTTPException(status_code=503, detail="Durable task queue is unavailable") from exc
+        if task is not None:
+            request_control.pause(request_id)
+            status = str(task["public"]["status"])
+            if status == "paused":
+                observability_store.complete_request(
+                    request_id, "paused", 0, 0, "Request paused before worker execution", technical_success=False
+                )
+            _audit(principal, "pause", "request", "success", resource_id=request_id)
+            return {
+                "code": 200,
+                "data": {"request_id": request_id, "paused": True, "queued": status == "paused", "status": status},
+            }
     queued = await request_runtime.pause(request_id)
     _audit(principal, "pause", "request", "success", resource_id=request_id)
     return {"code": 200, "data": {"request_id": request_id, "paused": True, "queued": queued}}
@@ -501,6 +819,13 @@ async def pause_request(request_id: str, principal: Principal = Depends(access_c
 @app.get("/api/v1/requests/{request_id}/status")
 async def request_status(request_id: str, principal: Principal = Depends(access_control.current_principal)):
     _authorize_request_owner(principal, request_id)
+    if durable_task_queue.api_enabled:
+        try:
+            task = durable_task_queue.get(request_id)
+        except DurableTaskUnavailable as exc:
+            raise HTTPException(status_code=503, detail="Durable task queue is unavailable") from exc
+        if task is not None:
+            return {"code": 200, "data": task["public"]}
     status = request_runtime.status(request_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Request status not found")
@@ -510,6 +835,30 @@ async def request_status(request_id: str, principal: Principal = Depends(access_
 @app.get("/api/v1/requests/{request_id}/events")
 async def request_events(request_id: str, principal: Principal = Depends(access_control.current_principal)):
     _authorize_request_owner(principal, request_id)
+    if durable_task_queue.api_enabled:
+        async def durable_event_stream():
+            last_status = ""
+            while True:
+                try:
+                    task = durable_task_queue.get(request_id)
+                except DurableTaskUnavailable:
+                    yield f"event: status\ndata: {json.dumps({'request_id': request_id, 'status': 'unavailable'})}\n\n"
+                    return
+                if task is None:
+                    return
+                status = str(task["public"]["status"])
+                if status != last_status:
+                    yield f"event: status\ndata: {json.dumps(task['public'], ensure_ascii=False)}\n\n"
+                    last_status = status
+                if status in TERMINAL_STATUSES:
+                    return
+                await asyncio.sleep(1)
+
+        return StreamingResponse(
+            durable_event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
     async def event_stream():
         async for event in request_runtime.events(request_id):
             yield f"event: {event['event']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -519,6 +868,43 @@ async def request_events(request_id: str, principal: Principal = Depends(access_
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/v1/requests/{request_id}/result")
+async def request_result(
+    request_id: str,
+    principal: Principal = Depends(access_control.current_principal),
+    http_request: Request = None,
+):
+    """Return a completed durable task result or a 202 lifecycle snapshot while it is pending."""
+    _authorize_request_owner(principal, request_id)
+    if not durable_task_queue.api_enabled:
+        raise HTTPException(status_code=404, detail="Durable task execution is not enabled")
+    try:
+        task = durable_task_queue.get(request_id)
+    except DurableTaskUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Durable task queue is unavailable") from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="Request task not found")
+    status = str(task["public"]["status"])
+    result = task.get("result")
+    if isinstance(result, dict):
+        result_code = int(result.get("code", 200))
+        if result_code >= 400:
+            return JSONResponse(status_code=result_code, content=result)
+        return result
+    if status in TERMINAL_STATUSES:
+        error_status = 409 if status == "paused" else 500
+        return _api_error(
+            http_request,
+            error_status,
+            "REQUEST_PAUSED" if status == "paused" else "REQUEST_RESULT_MISSING",
+            "The request did not produce a result.",
+            request_id=request_id,
+            retryable=status != "failed",
+            details={"runtime_status": status},
+        )
+    return JSONResponse(status_code=202, content={"code": 202, "data": task["public"]})
 
 
 @app.post("/api/v1/requests/{request_id}/feedback")
@@ -748,7 +1134,7 @@ async def run_evaluation(
             )
             if score["status"] == "passed":
                 passed_cases += 1
-            results.append({"case_id": case_id, **score})
+            results.append({"case_id": case_id, "category": case.get("category", "uncategorized"), **score})
         except Exception as exc:
             observability_store.complete_request(
                 request_id, "failed", 0, 0, str(exc), technical_success=False
@@ -756,13 +1142,9 @@ async def run_evaluation(
             observability_store.record_evaluation_case(
                 run_id, case_id, "error", request_id=request_id, details={"error": str(exc)}
             )
-            results.append({"case_id": case_id, "status": "error", "details": {"error": str(exc)}})
+            results.append({"case_id": case_id, "category": case.get("category", "uncategorized"), "status": "error", "details": {"error": str(exc)}})
 
-    summary = {
-        "total_cases": len(cases),
-        "passed_cases": passed_cases,
-        "pass_rate": round(passed_cases / len(cases) * 100, 2),
-    }
+    summary = summarize_scores(results)
     observability_store.complete_evaluation_run(run_id, passed_cases, summary)
     _audit(principal, "run", "evaluation", "success", resource_id=run_id, details=summary)
     return {"code": 200, "data": {"run_id": run_id, "summary": summary, "results": results}}
