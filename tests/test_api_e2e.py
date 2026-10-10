@@ -5,9 +5,10 @@ import unittest
 from fastapi.testclient import TestClient
 
 from api.main import app
+from api_test_case import ConfiguredApiTestCase
 
 
-class ApiEndToEndTests(unittest.TestCase):
+class ApiEndToEndTests(ConfiguredApiTestCase):
     def test_development_session_can_load_the_workspace_bootstrap_data(self):
         with TestClient(app) as client:
             session = client.get("/api/v1/session")

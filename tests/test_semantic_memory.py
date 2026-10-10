@@ -1,11 +1,20 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from memory.semantic_store import SemanticMemoryStore
 
 
 class SemanticMemoryStoreTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch(
+            "memory.semantic_store.DashScopeSDKEmbeddings",
+            side_effect=RuntimeError("Offline test: embedding provider unavailable"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_confirmed_memory_is_user_scoped_and_searchable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SemanticMemoryStore(Path(temp_dir) / "memory.db", retention_days=30)

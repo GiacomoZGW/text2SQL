@@ -4,10 +4,19 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from api.main import app
+from api_test_case import ConfiguredApiTestCase
 from core_engine.request_runtime import RequestQueueFull, RequestTimedOut
+from core_engine.runtime_config import ModelRuntimeConfig
 
 
-class ApiSemanticsTests(unittest.TestCase):
+class ApiSemanticsTests(ConfiguredApiTestCase):
+    def test_query_without_model_credentials_returns_service_unavailable(self):
+        with patch("api.main.model_runtime_config", ModelRuntimeConfig()), TestClient(app) as client:
+            response = client.post("/api/v1/query", json={"query": "count orders"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "SERVICE_UNAVAILABLE")
+
     def test_validation_errors_use_consistent_json_and_http_status(self):
         with TestClient(app) as client:
             response = client.post(
