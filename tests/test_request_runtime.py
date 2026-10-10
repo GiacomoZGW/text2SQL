@@ -54,16 +54,24 @@ class RequestRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.start()
         request_id = "runtime-timeout"
         request_control.clear(request_id)
+        release = threading.Event()
+        finished = threading.Event()
 
         def slow_job():
-            while not request_control.is_paused(request_id):
-                time.sleep(0.01)
-            raise RequestPaused("paused by timeout")
+            try:
+                while not release.is_set() and not request_control.is_paused(request_id):
+                    time.sleep(0.01)
+                raise RequestPaused("paused by timeout")
+            finally:
+                finished.set()
 
         try:
             with self.assertRaises(RequestTimedOut):
                 await runtime.submit(request_id, slow_job)
             self.assertEqual(runtime.status(request_id)["status"], "timed_out")
+            # The timed-out worker thread must observe the marker before cleanup clears it.
+            self.assertTrue(await asyncio.to_thread(finished.wait, 2))
         finally:
+            release.set()
             await runtime.stop()
             request_control.clear(request_id)
