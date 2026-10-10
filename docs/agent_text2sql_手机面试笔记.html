@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>联邦 Text2SQL 面试核心问答</title>
+  <style>
+    :root { --bg:#f6f7fb; --card:#fff; --ink:#162033; --sub:#667085; --line:#e6e8ef; --brand:#2563eb; --soft:#edf4ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.72; }
+    main { max-width:760px; margin:0 auto; padding:24px 16px 42px; }
+    header { padding:8px 4px 20px; }
+    h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
+    h2 { font-size:19px; margin:0; padding-right:24px; }
+    p { margin:10px 0; }
+    .lead { color:var(--sub); font-size:15px; }
+    .tag { display:inline-block; background:var(--soft); color:var(--brand); padding:3px 9px; border-radius:99px; font-size:12px; margin:3px 5px 0 0; }
+    details { background:var(--card); border:1px solid var(--line); border-radius:14px; margin:12px 0; overflow:hidden; }
+    summary { list-style:none; cursor:pointer; padding:17px 18px; position:relative; }
+    summary::-webkit-details-marker { display:none; }
+    summary::after { content:"＋"; position:absolute; right:18px; top:16px; color:var(--brand); font-size:22px; }
+    details[open] summary::after { content:"－"; }
+    .content { padding:0 18px 18px; border-top:1px solid var(--line); font-size:15px; }
+    .say { margin:14px 0; padding:12px 13px; background:#f8fafc; border-left:3px solid var(--brand); border-radius:6px; }
+    .label { color:var(--brand); font-weight:700; font-size:13px; }
+    code { background:#f1f3f7; border-radius:4px; padding:1px 5px; font-size:.9em; word-break:break-all; }
+    ul { padding-left:20px; margin:8px 0; }
+    li { margin:5px 0; }
+    table { width:100%; border-collapse:collapse; font-size:13px; margin-top:10px; }
+    th,td { padding:8px; border:1px solid var(--line); vertical-align:top; text-align:left; }
+    th { background:#f8fafc; }
+    footer { color:var(--sub); font-size:12px; padding:14px 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>联邦 Text2SQL 面试核心问答</h1>
+      <p class="lead">基于当前项目代码整理。点击问题展开，适合手机复习。</p>
+      <span class="tag">LangGraph</span><span class="tag">FastAPI</span><span class="tag">DuckDB</span><span class="tag">Docker</span><span class="tag">可观测性</span>
+    </header>
+
+    <details open>
+      <summary><h2>30 秒项目总述</h2></summary>
+      <div class="content"><div class="say">我独立实现了一个联邦 Text2SQL 系统：自然语言问题依次经过意图识别、Schema 检索、SQL 生成、只读和权限校验、语义审查、执行与结果分析。工作流由 LangGraph 编排，FastAPI 提供接口，DuckDB 支持多源联邦查询，并加入 Token/耗时监控、统一异常处理、任务队列和 Docker Compose 部署。核心目标是让链路可控、可追踪、可恢复，而不只是让模型生成一条 SQL。</div></div>
+    </details>
+
+    <details>
+      <summary><h2>为什么多 Agent？</h2></summary>
+      <div class="content">
+        <div class="say">Text2SQL 包含理解问题、找表、写 SQL、校验、执行、解释多个不同能力。我按职责拆分 Agent：Intent 做路由，Schema/Retrieval 缩小上下文，SQL Agent 生成候选，Validator/Reviewer 把关，Executor 执行，Analyst 解释结果。每一步可观测、可替换、可回退；出错也能定位在找表、生成还是执行阶段。</div>
+        <p><span class="label">代码主链路：</span><code>intent → supervisor → semantic_memory → schema → retrieval → sql → validator → reviewer → executor → analyst</code></p>
+        <p><span class="label">追问：</span>会不会变慢？会有编排开销，所以只有需要推理的节点调用模型；帮助类问题会短路，规则校验使用确定性代码，检索先压缩 Schema 上下文。</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><h2>为什么 LangGraph？</h2></summary>
+      <div class="content"><div class="say">这个场景是有状态、带条件分支和有限重试的工作流，不是线性 Chain。LangGraph 能显式表达：意图不清转澄清、SQL 不通过回生成、执行失败携带错误有限修复、任务暂停后等待用户补充。共享 State 也让上下文和执行轨迹可追踪。</div><p><span class="label">追问：</span>普通 if/else 也能做 Demo，但分支、重试和暂停增多后会变成难维护的嵌套逻辑；图结构的节点职责、跳转条件和终止条件更清晰。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>RAG 怎么做？</h2></summary>
+      <div class="content"><div class="say">RAG 主要用于 Schema，而不是把全库文档都塞进 Prompt。系统读取当前数据源的表、字段、类型和关系，将每张表组织成 Schema 文档；默认用 DashScope Embedding 向量化，查询时按相似度召回相关表字段，并保留词法兜底。Schema 变化会依据 catalog hash 失效重建索引。</div><p>检索负责缩小上下文，实时 Schema/目录仍是事实来源；执行前仍会做语义校验。因此 RAG 提升召回，但不承诺 SQL 必然正确。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>SQL 怎么校验？</h2></summary>
+      <div class="content"><div class="say">我使用多层防线：先清理 Markdown，只接受单条只读 SQL，拒绝写操作和危险关键字，并限制 LIMIT；再用 Parser 做语法检查；再结合用户、租户、表字段的 RBAC 策略校验；最后由 Reviewer 根据 Schema Catalog 检查表字段、Join、聚合和执行计划。全部通过后才会执行。</div>
+        <table><tr><th>层</th><th>主要作用</th></tr><tr><td>规则</td><td>只读、单语句、LIMIT</td></tr><tr><td>Parser</td><td>基础语法解析</td></tr><tr><td>权限</td><td>阻止越权表/字段</td></tr><tr><td>语义审查</td><td>表字段、Join、聚合合理性</td></tr><tr><td>执行反馈</td><td>数据库真实验证</td></tr></table>
+        <p><span class="label">追问：</span>只用正则不够；正则只能做快速拦截，无法可靠处理嵌套 SQL、方言和权限语义。生产还应配只读数据库账号，形成双重约束。</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><h2>SQL 错了怎么办？死循环怎么办？</h2></summary>
+      <div class="content"><div class="say">校验失败时不执行，系统把字段不存在、越权或非只读等明确原因反馈给生成节点。执行失败时只携带上一条 SQL、错误摘要、可用 Schema 和方言提示，进行有限修复。项目当前 <code>MAX_RETRIES=2</code>，State 中有 <code>error_count</code>；超过上限、SQL 重复或问题信息不足，就转澄清或返回结构化失败原因，而不是无限重试。</div><p>这样控制成本与等待时间，也让用户知道下一步该补什么信息。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>Agent State 保存什么？</h2></summary>
+      <div class="content"><div class="say">State 是单次请求的共享上下文，不是长期记忆。包括请求和身份信息、用户问题和对话上下文、意图和置信度、Schema 检索结果、候选 SQL、校验与执行结果、错误计数和执行轨迹。每个节点只写自己负责的产物，例如 Retrieval 写 Schema，Validator 写校验结论，Executor 写结果。</div><ul><li>身份：<code>request_id</code>、<code>user_id</code>、租户/数据源标识</li><li>路由：<code>intent</code>、置信度、澄清问题</li><li>生成：Schema 上下文、候选 SQL、最终 SQL</li><li>结果：校验结果、执行结果、<code>error_count</code>、<code>execution_trace</code></li></ul><p>长期偏好和历史摘要放 Memory Store，请求内数据放 State，避免上下文膨胀和历史污染。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>Token / 耗时监控怎么做？</h2></summary>
+      <div class="content"><div class="say">模型调用统一收敛在 <code>_invoke_llm</code>：调用前记录起始时间，调用后从响应元数据读取输入、输出、总 Token，并计算耗时；成功或失败都通过 <code>record_llm_call</code> 写入可观测存储。Agent 节点同时记录事件，所以能用 <code>request_id</code> 还原完整时间线。</div><p>后端有观测汇总接口，前端 <code>TokenMonitor</code> 展示请求数、Token、平均耗时、Agent 聚合和时间线。它能判断慢点是在模型、检索、数据库还是排队，并识别无效重试和 Prompt 膨胀。</p><p><span class="label">注意：</span>部分模型可能不返回精确 usage；这种场景只能记录可获得字段或做估算，估算不能当作精确计费 Token。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>异常处理怎么做？</h2></summary>
+      <div class="content"><div class="say">第一层在节点内处理预期错误：检索为空、SQL 校验失败、数据库异常都会转为结构化状态，进入重试、澄清或正常失败响应。第二层在任务运行时处理排队、超时和失败：本地模式使用有界异步队列，Redis Streams 模式支持持久任务、消费者重试和暂停。第三层由 FastAPI 全局异常处理器兜底，统一处理参数、权限、HTTP 和未知异常，并返回关联 <code>X-Request-ID</code> 的错误结构。</div><p>任务可经历 <code>queued</code>、<code>running</code>、<code>completed</code>、<code>failed</code>、<code>paused</code>；前端可轮询，也可订阅 SSE 事件。</p></div>
+    </details>
+
+    <details>
+      <summary><h2>面试中的真实性边界</h2></summary>
+      <div class="content"><ul><li>“1.5 万条数据 3 秒内”是特定本地聚合测试，不等同生产并发 SLA。</li><li>RAG、校验和执行反馈会提高可靠性，但不能声称消除幻觉。</li><li>Redis Streams 支持持久任务和重试；仍应通过幂等键、去重和审计应对至少一次投递。</li><li>Docker Compose 覆盖 API、Worker、Redis、PostgreSQL 等组件；生产还需密钥管理、告警、只读账号与容量规划。</li></ul></div>
+    </details>
+    <footer>对应 Markdown 版本：docs/agent_text2sql_面试核心问答.md</footer>
+  </main>
+</body>
+</html>
