@@ -239,3 +239,24 @@ memory.db-wal
 /docs/resume-project-facts.md
 /docs/深圳脉可科技_Python_Django_React_AI全栈岗位_多轮面试准备.md
 
+# Local datasets and database state
+*.csv
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local credentials; retain reviewed public configuration files
+.env.*
+!/.env.example
+!/.env.docker.example
+!/frontend/.env.demo
+
+# Local IDE files, temporary files, and generated vector indexes
+.idea/
+/tmp/
+/current_backup.patch
+/current_status.txt
+/vector_store/chroma_db/
