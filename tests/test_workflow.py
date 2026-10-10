@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,9 +13,10 @@ class ValidateSqlTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.database_root = Path(directory.name)
-        with sqlite3.connect(self.database_root / "ecommerce_test.db") as connection:
+        with closing(sqlite3.connect(self.database_root / "ecommerce_test.db")) as connection:
             connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total_amount REAL)")
             connection.execute("INSERT INTO orders (total_amount) VALUES (10.0)")
+            connection.commit()
         patcher = patch("agents.workflow.BASE_DIR", self.database_root)
         patcher.start()
         self.addCleanup(patcher.stop)

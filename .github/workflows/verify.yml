@@ -42,8 +42,6 @@ jobs:
       OPENAI_BASE_URL: http://127.0.0.1:9/v1
       DATA_AGENT_AUTH_MODE: development
       TASK_EXECUTION_MODE: inline
-      MEMORY_DB_PATH: ${{ runner.temp }}/e2e-memory.db
-      OBSERVABILITY_DB_PATH: ${{ runner.temp }}/e2e-observability.db
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -61,6 +59,9 @@ jobs:
       - run: VITE_API_BASE=http://127.0.0.1:8000 npm run build
         working-directory: frontend
       - run: API_ALLOWED_ORIGINS=http://127.0.0.1:4173 python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 > api-e2e.log 2>&1 &
+        env:
+          MEMORY_DB_PATH: ${{ runner.temp }}/e2e-memory.db
+          OBSERVABILITY_DB_PATH: ${{ runner.temp }}/e2e-observability.db
       - run: curl --retry 15 --retry-connrefused --retry-delay 2 --fail-with-body http://127.0.0.1:8000/health/ready
       - run: npm run preview -- --host 127.0.0.1 --port 4173 > frontend-e2e.log 2>&1 &
         working-directory: frontend
