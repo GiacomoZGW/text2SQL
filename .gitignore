@@ -231,3 +231,11 @@ memory.db
 memory.db-shm
 memory.db-wal
 
+# Local project analysis and interview notes
+/docs/agent_text2sql_手机面试笔记.html
+/docs/agent_text2sql_面试核心问答.md
+/docs/resume-business-impact.md
+/docs/resume-project-description.md
+/docs/resume-project-facts.md
+/docs/深圳脉可科技_Python_Django_React_AI全栈岗位_多轮面试准备.md
+
